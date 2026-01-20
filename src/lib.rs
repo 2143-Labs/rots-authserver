@@ -45,6 +45,7 @@ impl Config {
         //.await
         //.context("Unable to run migrations")?;
         let app = self.start_server(database).await?;
+        println!("Starting server on port {}", self.port);
 
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.port))
             .await

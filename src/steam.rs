@@ -19,5 +19,7 @@ pub async fn weak_login(
     Extension(config): Extension<Arc<Config>>,
     Json(payload): Json<WeakLoginRequest>,
 ) -> impl IntoResponse {
-    "hi"
+    Json(WeakLoginResponse {
+        player_id: payload.steam_player_id as u128,
+    })
 }
