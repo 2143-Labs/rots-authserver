@@ -14,6 +14,13 @@ pub struct Config {
     #[clap(long, env)]
     pub database_url: String,
 
+    #[clap(long, env)]
+    pub discord_client_id: String,
+    #[clap(long, env)]
+    pub discord_client_secret: String,
+    #[clap(long, env)]
+    pub discord_redirect_uri: String,
+
     /// Do not actually run api requests
     #[clap(long, env)]
     pub dry_run: bool,
