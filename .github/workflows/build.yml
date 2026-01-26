@@ -35,6 +35,14 @@ jobs:
       - name: Build with Nix
         run: nix build .#server
 
+      - name: Collect Linux executables
+        run: |
+          # Check for client executable (default package)
+          if [ -x result/bin/rots-authserver ]; then
+            cp -L result/bin/rots-authserver rots-authserver-linux
+            chmod +x rots-authserver-linux
+          fi
+
       - name: Build container with Nix
         run: nix build .#container
 
@@ -49,20 +57,12 @@ jobs:
           RESULT=$(readlink -f ./result)
           echo "Result path: $RESULT"
           IMAGE_TAG=$(date +%Y%m%d_%H%M)
-          skopeo copy docker-archive://$RESULT docker://ghcr.io/2143-labs/bevy2025:gameserver-${IMAGE_TAG}
+          skopeo copy docker-archive://$RESULT docker://ghcr.io/2143-labs/rots-authserver:server-${IMAGE_TAG}
           # if not pull request, then also push as latest
           if [ "${{ github.event_name }}" == "pull_request" ]; then
-            skopeo copy docker-archive://$RESULT docker://ghcr.io/2143-labs/bevy2025:gameserver-branch-${{ github.head_ref }}
+            skopeo copy docker-archive://$RESULT docker://ghcr.io/2143-labs/rots-authserver:server-branch-${{ github.head_ref }}
           else
-            skopeo copy docker-archive://$RESULT docker://ghcr.io/2143-labs/bevy2025:gameserver-latest
-          fi
-
-      - name: Collect Linux executables
-        run: |
-          # Check for client executable (default package)
-          if [ -x result/bin/rots-authserver ]; then
-            cp -L result/bin/rots-authserver rots-authserver-linux
-            chmod +x rots-authserver-linux
+            skopeo copy docker-archive://$RESULT docker://ghcr.io/2143-labs/rots-authserver:server-latest
           fi
 
       - name: Upload Linux artifacts
