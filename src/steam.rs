@@ -1,6 +1,7 @@
 use crate::Config;
 use crate::discord::basic_error_response;
 use axum::Json;
+use axum::response::Response;
 use axum::{extract::Extension, response::IntoResponse};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ pub async fn weak_login(
     Extension(config): Extension<Arc<Config>>,
     Extension(database): Extension<PgPool>,
     Json(payload): Json<WeakLoginRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, Response> {
     println!(
         "Weak login request for steam player id: {}",
         &payload.steam_player_id
@@ -45,11 +46,13 @@ pub async fn weak_login(
         INSERT INTO social.steam_login_attempts (attempted_at, steam_user_id, used_weak_login, login_token)
         VALUES (now(), $1, true, $2)
         "#,
-        &payload.steam_player_id
+        &payload.steam_player_id,
         &login_token,
     ).execute(&database)
         .await
-        .expect("Failed to record login attempt");
+        .map_err(|e| {
+            basic_error_response(&format!("Failed to record login attempt: {}", e))
+        })?;
 
     // TODO get steam user info from this user id (avatar etc)
 
@@ -61,7 +64,7 @@ pub async fn weak_login(
         DO NOTHING
         RETURNING player_id
         "#,
-        user.id,
+        &payload.steam_player_id,
     ).fetch_one(&database)
         .await
         .map_err(|e| {
@@ -77,11 +80,13 @@ pub async fn weak_login(
         player_id_to_steam_id.player_id,
     ).execute(&database)
         .await
-        .expect("Failed to record valid login");
+        .map_err(|e| {
+            basic_error_response(&format!("Failed to record valid login: {}", e))
+        })?;
 
-    Json(WeakLoginResponse {
+    Ok(Json(WeakLoginResponse {
         player_id: player_id_to_steam_id.player_id as u64,
         login_token,
         success: true,
-    })
+    }))
 }

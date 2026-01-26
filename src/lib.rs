@@ -38,19 +38,21 @@ pub enum Action {
 
 impl Config {
     async fn start_server(&self, database: PgPool) -> anyhow::Result<axum::Router> {
-        let app = api::create_api(database);
+        let app = api::create_api(database.clone());
 
         // Add config so it can be used in web handlers
         let app = app.layer(axum::Extension(Arc::new(self.clone())));
+        let app = app.layer(axum::Extension(database.clone()));
 
         Ok(app)
     }
 
     pub async fn listen(&self, database: PgPool) -> anyhow::Result<Infallible> {
-        //sqlx::migrate::run("./migrations")
-        //.run(&database)
-        //.await
-        //.context("Unable to run migrations")?;
+        use anyhow::Context;
+        sqlx::migrate!("./migrations")
+            .run(&database)
+            .await
+            .context("Unable to run migrations")?;
         let app = self.start_server(database).await?;
         println!("Starting server on port {}", self.port);
 

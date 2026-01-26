@@ -59,7 +59,7 @@ pub async fn callback(
         SET completed_at = now()
         WHERE state = $1 AND completed_at IS NULL
         "#,
-        &state,
+        &params.state,
     ).execute(&database)
         .await
         .expect("Failed to record login attempt");
@@ -108,7 +108,7 @@ pub async fn callback(
         user.username,
         user.avatar,
         global_name,
-    ).fetch_one(&database)
+    ).execute(&database)
         .await
         .map_err(|e| {
             basic_error_response(&format!("Failed to insert or fetch user: {}", e))
@@ -121,11 +121,13 @@ pub async fn callback(
         SET
             linked_discord_user_id = $1,
             linked_token = $3,
+            refresh_token = $4
         WHERE state = $2
         "#,
         user.id,
         &params.state,
         &token_response.access_token,
+        &token_response.refresh_token,
     ).execute(&database)
         .await
         .map_err(|e| {
@@ -133,20 +135,45 @@ pub async fn callback(
         }
     );
 
+        //INSERT INTO social.playerid_by_discord (discord_user_id, player_id)
+        //VALUES ($1, nextval('social.playerid_seq'))
+        //ON CONFLICT (discord_user_id)
+        //DO NOTHING
+        //RETURNING player_id
     let player_id_to_discord_id = sqlx::query!(
         r#"
-        INSERT INTO social.playerid_by_discord (discord_user_id, player_id)
-        VALUES ($1, nextval('social.playerid_seq'))
-        ON CONFLICT (discord_user_id)
-        DO NOTHING
-        RETURNING player_id
+        SELECT player_id
+        FROM social.playerid_by_discord
+        WHERE discord_user_id = $1
         "#,
         user.id,
-    ).fetch_one(&database)
+    ).fetch_optional(&database)
         .await
         .map_err(|e| {
             basic_error_response(&format!("Failed to fetch registered user: {}", e))
         })?;
+
+    let player_id = match player_id_to_discord_id {
+        Some(pid) => pid.player_id,
+        None => {
+            tracing::info!("Creating new player id for discord user id {}", user.id);
+
+            let res = sqlx::query!(
+                r#"
+                INSERT INTO social.playerid_by_discord (discord_user_id, player_id)
+                VALUES ($1, nextval('social.playerid_seq'))
+                RETURNING player_id
+                "#,
+                user.id,
+            ).fetch_one(&database)
+                .await
+                .map_err(|e| {
+                    basic_error_response(&format!("Failed to create registered user: {}", e))
+                })?;
+
+            res.player_id
+        }
+    };
 
     let login_token = crate::steam::create_token();
 
@@ -156,12 +183,10 @@ pub async fn callback(
         VALUES ($1, $2, now())
         "#,
         &login_token,
-        player_id_to_steam_id.player_id,
+        player_id,
     ).execute(&database)
         .await
         .expect("Failed to record valid login");
-
-    let player_id = player_id_to_discord_id.player_id;
 
     let is_production = cfg.redirect_uri.starts_with("https://");
     let cookie_attributes = if is_production {
@@ -170,12 +195,14 @@ pub async fn callback(
         "; SameSite=Lax"
     };
 
+    let location = format!("http://192.168.1.32:8080/#player_id={}&login_token={}", player_id, login_token);
+
     let res = Response::builder()
         .status(axum::http::StatusCode::FOUND)
         .header(axum::http::header::CONTENT_TYPE, "text/plain")
         .header(axum::http::header::CACHE_CONTROL, "no-cache")
         // Send them back to /
-        .header(axum::http::header::LOCATION, "/")
+        .header(axum::http::header::LOCATION, location)
         // Add logged in cookies
         //   1. discord user id
         //   2. api token
@@ -309,7 +336,7 @@ pub async fn fetch_user(token: &str) -> Result<DiscordUser> {
 }
 
 #[derive(Debug, Deserialize)]
-struct CallbackAPIParams {
+pub struct CallbackAPIParams {
     code: Option<String>,
     error: Option<String>,
     state: String,
