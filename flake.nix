@@ -39,7 +39,7 @@
           ];
           config = {
             ExposedPorts = { "8000/udp" = { }; };
-            EntryPoint = [ "${serverPackage}/bin/server" ];
+            EntryPoint = [ "${serverPackage}/bin/rots-authserver" ];
             Env = [
               "RUST_LOG=info"
             ];
