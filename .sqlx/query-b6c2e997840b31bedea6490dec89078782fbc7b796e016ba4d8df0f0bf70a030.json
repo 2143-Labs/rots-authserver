@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO social.steam_login_attempts (attempted_at, steam_user_id, used_weak_login, login_token)\n        VALUES (now(), $1, true, $2)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b6c2e997840b31bedea6490dec89078782fbc7b796e016ba4d8df0f0bf70a030"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO social.playerid_by_steam (steam_user_id, player_id)\n        VALUES ($1, nextval('social.playerid_seq'))\n        ON CONFLICT (steam_user_id)\n        DO NOTHING\n        RETURNING player_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "player_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3185b2ba7b6cb8b5a1b8fdd2b9e346e0c30578ba43b18c2b740195e31a82732d"
+}

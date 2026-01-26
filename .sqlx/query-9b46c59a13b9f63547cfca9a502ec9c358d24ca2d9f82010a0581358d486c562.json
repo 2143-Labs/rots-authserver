@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO social.player_valid_logins (login_token, player_id, created_at)\n        VALUES ($1, $2, now())\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9b46c59a13b9f63547cfca9a502ec9c358d24ca2d9f82010a0581358d486c562"
+}

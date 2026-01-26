@@ -1,0 +1,109 @@
+name: Version, build  and Release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: build-release-main-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Linux build (Nix)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v26
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: Build with Nix
+        run: nix build .#server
+
+      - name: Build container with Nix
+        run: nix build .#container
+
+      - name: Install skopeo
+        run: sudo apt-get install -y skopeo
+
+      - name: Push container with skopeo
+        run: |
+          set -euo pipefail
+          skopeo login --username ${{ github.actor }} --password "${{ secrets.GITHUB_TOKEN }}" ghcr.io
+          ls -la ./result
+          RESULT=$(readlink -f ./result)
+          echo "Result path: $RESULT"
+          IMAGE_TAG=$(date +%Y%m%d_%H%M)
+          skopeo copy docker-archive://$RESULT docker://ghcr.io/2143-labs/bevy2025:gameserver-${IMAGE_TAG}
+          # if not pull request, then also push as latest
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            skopeo copy docker-archive://$RESULT docker://ghcr.io/2143-labs/bevy2025:gameserver-branch-${{ github.head_ref }}
+          else
+            skopeo copy docker-archive://$RESULT docker://ghcr.io/2143-labs/bevy2025:gameserver-latest
+          fi
+
+      - name: Collect Linux executables
+        run: |
+          # Check for client executable (default package)
+          if [ -x result/bin/rots-authserver ]; then
+            cp -L result/bin/rots-authserver rots-authserver-linux
+            chmod +x rots-authserver-linux
+          fi
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-executables
+          path: |
+            rots-authserver-linux
+          if-no-files-found: warn
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-linux
+    # Only create releases on main branch pushes, not PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Create tag name and version name
+        id: version-info
+        run: |
+          echo "TAG_NAME=v${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version-info.outputs.TAG_NAME }}
+          name: Release ${{ steps.version-info.outputs.TAG_NAME }}
+          draft: false
+          prerelease: false
+          target_commitish: main
+          files: |
+            dist/rots-authserver-linux
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

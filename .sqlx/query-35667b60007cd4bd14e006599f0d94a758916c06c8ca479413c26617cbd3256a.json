@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE social.discord_login_attempts\n        SET completed_at = now()\n        WHERE state = $1 AND completed_at IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "35667b60007cd4bd14e006599f0d94a758916c06c8ca479413c26617cbd3256a"
+}

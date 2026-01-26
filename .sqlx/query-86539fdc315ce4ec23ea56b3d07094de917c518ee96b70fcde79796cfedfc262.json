@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO social.discord_accounts (discord_user_id, discord_username, discord_avatar, discord_global_name)\n        VALUES ($1, $2, $3, $4)\n        ON CONFLICT (discord_user_id)\n        DO UPDATE SET\n            discord_avatar = EXCLUDED.discord_avatar,\n            discord_global_name = EXCLUDED.discord_global_name\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "86539fdc315ce4ec23ea56b3d07094de917c518ee96b70fcde79796cfedfc262"
+}

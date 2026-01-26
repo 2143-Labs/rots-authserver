@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE social.discord_login_attempts\n        SET\n            linked_discord_user_id = $1,\n            linked_token = $3,\n            refresh_token = $4\n        WHERE state = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e94544ac9688d66ff9665d0704f57c272aa5147ad785dfdf13ed08b0eafaa70a"
+}

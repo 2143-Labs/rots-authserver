@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO social.discord_login_attempts (state, attempted_at)\n        VALUES ($1, now())\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0d9acf58675ce468e8916127ed1c1bf267a0a06d2205319e89a99ae055c11e7c"
+}
