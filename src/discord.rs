@@ -195,7 +195,7 @@ pub async fn callback(
         "; SameSite=Lax"
     };
 
-    let location = format!("http://192.168.1.32:8080/#player_id={}&login_token={}", player_id, login_token);
+    let location = format!("/#player_id={}&login_token={}", player_id, login_token);
 
     let res = Response::builder()
         .status(axum::http::StatusCode::FOUND)
