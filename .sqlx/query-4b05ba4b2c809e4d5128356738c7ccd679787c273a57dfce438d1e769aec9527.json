@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.name, c.claim_code, a.display_name AS \"display_name?\"\n           FROM social.characters c\n           LEFT JOIN social.accounts a ON a.account_id = $2\n           WHERE c.character_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "claim_code",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "display_name?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "4b05ba4b2c809e4d5128356738c7ccd679787c273a57dfce438d1e769aec9527"
+}

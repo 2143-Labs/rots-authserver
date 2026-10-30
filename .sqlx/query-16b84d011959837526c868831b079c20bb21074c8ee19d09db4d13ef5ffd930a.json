@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM social.oauth_states WHERE created_at < now() - interval '10 minutes'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "16b84d011959837526c868831b079c20bb21074c8ee19d09db4d13ef5ffd930a"
+}

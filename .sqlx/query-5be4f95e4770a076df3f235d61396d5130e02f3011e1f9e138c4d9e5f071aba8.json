@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO social.characters (name, claim_code) VALUES ('guest', $1)\n             ON CONFLICT (claim_code) DO NOTHING RETURNING character_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "character_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5be4f95e4770a076df3f235d61396d5130e02f3011e1f9e138c4d9e5f071aba8"
+}

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE social.characters SET account_id = $1, claim_code = NULL\n         WHERE claim_code = upper($2) AND account_id IS NULL RETURNING character_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "character_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ff1d16c6645ba6a648ce14e89bbb0c424762af039c1c17463be758c4ba792d39"
+}

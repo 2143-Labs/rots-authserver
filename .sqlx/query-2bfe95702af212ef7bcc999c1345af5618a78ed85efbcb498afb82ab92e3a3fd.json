@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT character_id FROM social.characters WHERE account_id = $1\n             ORDER BY created_at DESC, character_id DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "character_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2bfe95702af212ef7bcc999c1345af5618a78ed85efbcb498afb82ab92e3a3fd"
+}

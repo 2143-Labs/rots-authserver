@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM social.oauth_states WHERE state = $1 AND provider = $2\n           RETURNING pkce_verifier, return_to, guest_token_hash,\n                     created_at > now() - interval '10 minutes' AS \"fresh!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pkce_verifier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "return_to",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "guest_token_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "fresh!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "adc5b670732cb586e306bd9a9db52a96350eecd3579b2426308efce266005db2"
+}

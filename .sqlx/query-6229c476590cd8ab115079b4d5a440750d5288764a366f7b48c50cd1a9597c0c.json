@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM social.sessions WHERE character_id = $1 AND account_id IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6229c476590cd8ab115079b4d5a440750d5288764a366f7b48c50cd1a9597c0c"
+}

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO social.sessions (token_hash, account_id, character_id, expires_at)\n         VALUES ($1, $2, $3, now() + make_interval(days => $4))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "17ee14ec5c55ae0cff0190bdf4538ceb0f1d7c776093e6cf81083b50d128a16a"
+}
