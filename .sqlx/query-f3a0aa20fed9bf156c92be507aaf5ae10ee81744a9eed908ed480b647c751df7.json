@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.name,\n             (SELECT i.provider FROM social.account_identities i\n              WHERE i.account_id = $2 ORDER BY i.created_at, i.provider LIMIT 1) AS \"prov?\"\n           FROM social.characters c WHERE c.character_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "prov?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "f3a0aa20fed9bf156c92be507aaf5ae10ee81744a9eed908ed480b647c751df7"
+}

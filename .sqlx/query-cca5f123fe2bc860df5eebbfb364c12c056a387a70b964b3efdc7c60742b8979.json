@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE social.characters SET name = 'Guest-' || character_id WHERE character_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cca5f123fe2bc860df5eebbfb364c12c056a387a70b964b3efdc7c60742b8979"
+}
