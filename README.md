@@ -36,8 +36,11 @@ so restart game servers after restarting it.
 Tests: `nix develop -c ./scripts/ci-test.sh` starts a throwaway Postgres and an in-memory
 Temporal dev server and runs the unit and integration tests; CI runs the same script.
 
-Migrations run at startup. After changing a query, run `cargo sqlx prepare` against a
-migrated database and commit `.sqlx/`.
+Migrations run at startup (and `scripts/dev-stack.sh` applies them before building, because
+the sqlx macros check every query at compile time). After changing a query, run
+`DATABASE_URL=postgres://postgres@127.0.0.1:55432/postgres cargo sqlx prepare` against the
+stack's migrated database and commit `.sqlx/`; with no database running the macros fail with
+`Connection refused`.
 
 ## Configuration
 
