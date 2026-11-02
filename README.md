@@ -5,7 +5,7 @@ au.2143.me, or play as a guest. Every game-server connection carries a **game ti
 an EdDSA JWT valid for 300 s, which the game server verifies offline with the public key
 from `GET /api/v1/ticket/public-key`.
 
-Architecture, flows and state machines: [ROTS architecture](https://github.com/2143-Labs/bevy2025/blob/main/docs/architecture.html).
+Architecture, flows and state machines: [ROTS design doc](https://rots.john2143.com/design.html).
 
 The gateway serves this service under `{PUBLIC_URL}/auth` and strips the `/auth` prefix,
 so the routes below are served at the root (`/health`, `/api/v1/...`).
@@ -173,5 +173,5 @@ Workflow code must be deterministic: time only from `ctx.workflow_time()`,
 `BTreeMap`/`BTreeSet` in workflow state, no I/O and no randomness. Wrap any change to the
 commands a workflow issues (activities, timers, external signals, continue-as-new) in
 `ctx.patched("<change-id>")`: during a rolling deploy the old and new authservers poll the
-same task queue. State-machine diagrams: [coordinator](https://github.com/2143-Labs/bevy2025/blob/main/docs/architecture.html#coordinator),
-[session](https://github.com/2143-Labs/bevy2025/blob/main/docs/architecture.html#session).
+same task queue. State-machine diagrams: [coordinator](https://rots.john2143.com/design.html#coordinator),
+[session](https://rots.john2143.com/design.html#session).
