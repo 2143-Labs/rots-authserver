@@ -7,6 +7,8 @@ use ed25519_dalek::pkcs8::EncodePrivateKey;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 
+use crate::api::AppState;
+
 pub const TICKET_ISSUER: &str = "rots-authserver";
 pub const TICKET_TTL_SECS: u64 = 300;
 
@@ -28,6 +30,58 @@ pub struct GameTicketClaims {
     pub name: String,         // character name
     pub iat: u64,
     pub exp: u64, // iat + 300
+    /// Game-server slot the ticket is for; servers with `ROTS_SERVER_SLOT` reject others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srv: Option<u32>,
+}
+
+/// `"account"` for account sessions, `"guest"` otherwise.
+pub fn kind(account_id: Option<i64>) -> &'static str {
+    if account_id.is_some() {
+        "account"
+    } else {
+        "guest"
+    }
+}
+
+/// Signs a ticket for `character_id` bound to game-server slot `srv`. Returns the
+/// ticket and its expiry (unix seconds).
+pub async fn mint(
+    st: &AppState,
+    character_id: i64,
+    account_id: Option<i64>,
+    sid: &str,
+    srv: u32,
+) -> anyhow::Result<(String, u64)> {
+    let row = sqlx::query!(
+        r#"SELECT c.name,
+             (SELECT i.provider FROM social.account_identities i
+              WHERE i.account_id = $2 ORDER BY i.created_at, i.provider LIMIT 1) AS "prov?"
+           FROM social.characters c WHERE c.character_id = $1"#,
+        character_id,
+        account_id
+    )
+    .fetch_optional(&st.db)
+    .await
+    .context("loading character")?;
+    let Some(row) = row else {
+        bail!("character not found");
+    };
+    let iat = jsonwebtoken::get_current_timestamp();
+    let claims = GameTicketClaims {
+        iss: TICKET_ISSUER.into(),
+        aud: st.config.public_url.clone(),
+        sub: character_id.to_string(),
+        sid: sid.to_owned(),
+        kind: kind(account_id).into(),
+        prov: row.prov.filter(|_| account_id.is_some()),
+        acc: account_id,
+        name: row.name,
+        iat,
+        exp: iat + TICKET_TTL_SECS,
+        srv: Some(srv),
+    };
+    Ok((st.tickets.sign(&claims)?, claims.exp))
 }
 
 impl TicketKeys {
@@ -80,6 +134,7 @@ mod tests {
             name: "Steam 7656".into(),
             iat,
             exp: iat + TICKET_TTL_SECS,
+            srv: Some(0),
         }
     }
 

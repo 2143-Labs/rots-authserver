@@ -96,6 +96,19 @@ pub async fn session_by_hash(db: &PgPool, token_hash: &str) -> anyhow::Result<Op
     .context("loading session")
 }
 
+/// Whether the session a ticket was minted for (its `sid`, the first 16 hex chars of
+/// the token hash) still exists and is unexpired. Joins of ended sessions are refused.
+pub async fn session_live(db: &PgPool, sid: &str) -> anyhow::Result<bool> {
+    sqlx::query_scalar!(
+        r#"SELECT EXISTS (SELECT 1 FROM social.sessions
+                          WHERE left(token_hash, 16) = $1 AND expires_at > now()) AS "live!""#,
+        sid
+    )
+    .fetch_one(db)
+    .await
+    .context("checking session")
+}
+
 /// Stores a new session and returns its plaintext token (never stored).
 pub async fn create_session(
     db: impl sqlx::PgExecutor<'_>,

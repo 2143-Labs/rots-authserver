@@ -18,7 +18,8 @@ use crate::{
     Config,
     providers::{self, ProviderConfig, Providers},
     sessions::{self, SESSION_COOKIE, SESSION_TTL_DAYS, Session},
-    tickets::{GameTicketClaims, TICKET_ISSUER, TICKET_TTL_SECS, TicketKeys},
+    temporal::{self, TemporalSlot, session::PlayOutcome},
+    tickets::{self, TicketKeys},
 };
 
 #[derive(Clone)]
@@ -28,6 +29,8 @@ pub struct AppState {
     pub tickets: Arc<TicketKeys>,
     pub providers: Arc<Providers>,
     pub http: reqwest::Client,
+    /// Temporal client, published by the worker thread once connected.
+    pub temporal: TemporalSlot,
 }
 
 /// The gateway strips `/auth`, so these are served at the root.
@@ -37,7 +40,7 @@ pub fn create_api(state: AppState) -> Router {
         .route("/ticket/public-key", get(ticket_public_key))
         .route("/guest", post(create_guest))
         .route("/me", get(me))
-        .route("/ticket", post(issue_ticket))
+        .route("/play", post(play))
         .route("/steam/ticket", post(steam_ticket_login))
         .route("/steam/callback", get(steam_callback))
         .route("/{provider}/login", get(provider_login))
@@ -47,6 +50,7 @@ pub fn create_api(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .nest("/api/v1", api_routes)
         .with_state(state)
         .layer(NormalizePathLayer::trim_trailing_slash())
@@ -55,6 +59,19 @@ pub fn create_api(state: AppState) -> Router {
 /// Returns 200, always
 async fn health() -> (StatusCode, &'static str) {
     (StatusCode::OK, "Ok")
+}
+
+/// 200 once the Temporal worker is connected (or Temporal is not configured), else
+/// 503: a pod that cannot reach Temporal cannot serve `/play` or game-server joins.
+async fn ready(State(st): State<AppState>) -> Response {
+    if st.config.temporal_address.is_some() && !temporal::is_connected(&st) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "starting" })),
+        )
+            .into_response();
+    }
+    Json(json!({ "status": "ready" })).into_response()
 }
 
 /// JSON `{"error":"<code>"}` with a status; logged when turned into a response.
@@ -215,54 +232,61 @@ async fn me(
 }
 
 #[derive(Serialize)]
-struct TicketResponse {
+struct PlayResponse {
     ticket: String,
     expires_at: u64,
     character_id: i64,
     kind: &'static str,
+    server: AssignedServer,
 }
 
-async fn issue_ticket(
+#[derive(Serialize)]
+struct AssignedServer {
+    slot: u32,
+    /// `host:port` for native clients.
+    udp: String,
+    /// Same-origin WebSocket path for web clients.
+    ws_path: String,
+}
+
+/// A ticket for the session's current character, bound to the game-server slot the
+/// coordinator picked.
+async fn play(
     State(st): State<AppState>,
     Session(session): Session,
-) -> Result<Json<TicketResponse>, ApiError> {
+) -> Result<Json<PlayResponse>, ApiError> {
     let s = session.ok_or_else(ApiError::no_session)?;
-    let row = sqlx::query!(
-        r#"SELECT c.name,
-             (SELECT i.provider FROM social.account_identities i
-              WHERE i.account_id = $2 ORDER BY i.created_at, i.provider LIMIT 1) AS "prov?"
-           FROM social.characters c WHERE c.character_id = $1"#,
-        s.character_id,
-        s.account_id
-    )
-    .fetch_optional(&st.db)
-    .await?
-    .ok_or_else(ApiError::no_session)?;
-
-    let kind = if s.account_id.is_some() {
-        "account"
-    } else {
-        "guest"
-    };
-    let iat = jsonwebtoken::get_current_timestamp();
-    let claims = GameTicketClaims {
-        iss: TICKET_ISSUER.into(),
-        aud: st.config.public_url.clone(),
-        sub: s.character_id.to_string(),
-        sid: s.token_hash[..16].to_owned(),
-        kind: kind.into(),
-        prov: row.prov.filter(|_| s.account_id.is_some()),
-        acc: s.account_id,
-        name: row.name,
-        iat,
-        exp: iat + TICKET_TTL_SECS,
-    };
-    Ok(Json(TicketResponse {
-        ticket: st.tickets.sign(&claims)?,
-        expires_at: claims.exp,
-        character_id: s.character_id,
-        kind,
-    }))
+    match temporal::play(&st, &s).await? {
+        PlayOutcome::Assigned {
+            ticket,
+            expires_at,
+            slot,
+        } => {
+            let host = st.config.game_udp_host.as_deref().unwrap_or("localhost");
+            let port = u32::from(st.config.game_udp_port_base) + slot;
+            Ok(Json(PlayResponse {
+                ticket,
+                expires_at,
+                character_id: s.character_id,
+                kind: tickets::kind(s.account_id),
+                server: AssignedServer {
+                    slot,
+                    udp: format!("{host}:{port}"),
+                    ws_path: format!("/ws/{slot}"),
+                },
+            }))
+        }
+        PlayOutcome::NoGameServer => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_game_server",
+        )),
+        PlayOutcome::Busy => Err(ApiError::new(StatusCode::CONFLICT, "play_in_progress")),
+        PlayOutcome::Ended => Err(ApiError::no_session()),
+        PlayOutcome::Failed { reason } => {
+            tracing::warn!(sid = &s.token_hash[..16], reason, "play failed");
+            Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -304,6 +328,7 @@ async fn steam_ticket_login(
         ApiError::new(StatusCode::UNAUTHORIZED, "steam_ticket_rejected")
     })?;
     let subject = steam_id.to_string();
+    let prior_sid = session.as_ref().map(|p| p.token_hash[..16].to_owned());
     let (token, character_id) = sessions::login_account(
         &st.db,
         "steam",
@@ -312,6 +337,10 @@ async fn steam_ticket_login(
         session,
     )
     .await?;
+    // login_account replaced the prior session; end its session workflow too.
+    if let Some(sid) = prior_sid {
+        temporal::signal_logout(&st, &sid);
+    }
     Ok(session_response(body.client, token, |session_token| {
         SteamTicketResponse {
             session_token,
@@ -370,6 +399,7 @@ async fn logout(
         )
         .execute(&st.db)
         .await?;
+        temporal::signal_logout(&st, &s.token_hash[..16]);
     }
     let clear = format!("{SESSION_COOKIE}=; Path=/auth; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
     Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, clear)]).into_response())
@@ -498,18 +528,24 @@ async fn finish_login(
             Err(e) => return login_failed(st, provider, "internal", e),
         },
     };
+    let prior_sid = prior.as_ref().map(|p| p.token_hash[..16].to_owned());
     match sessions::login_account(&st.db, provider, subject, display_name, prior).await {
-        Ok((token, _)) => (
-            StatusCode::FOUND,
-            [
-                (
-                    header::LOCATION,
-                    format!("{}{}", st.config.public_url, stored.return_to),
-                ),
-                (header::SET_COOKIE, session_cookie(&token)),
-            ],
-        )
-            .into_response(),
+        Ok((token, _)) => {
+            if let Some(sid) = prior_sid {
+                temporal::signal_logout(st, &sid);
+            }
+            (
+                StatusCode::FOUND,
+                [
+                    (
+                        header::LOCATION,
+                        format!("{}{}", st.config.public_url, stored.return_to),
+                    ),
+                    (header::SET_COOKIE, session_cookie(&token)),
+                ],
+            )
+                .into_response()
+        }
         Err(e) => login_failed(st, provider, "internal", e),
     }
 }

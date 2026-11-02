@@ -13,9 +13,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test:
+    name: Unit + integration tests
+    runs-on: [self-hosted, nixos]
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Test against Postgres + Temporal dev server
+        run: nix develop -c ./scripts/ci-test.sh
+
   build-linux:
     name: Linux build (Nix)
     runs-on: [self-hosted, nixos]
+    needs: test
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     permissions:
       contents: read

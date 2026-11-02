@@ -18,7 +18,7 @@
         # Server package - headless, doesn't need graphics libraries
         serverPackage = naersk-lib.buildPackage {
           src = ./.;
-          nativeBuildInputs = with pkgs; [ pkg-config ];
+          nativeBuildInputs = with pkgs; [ pkg-config protobuf ];
           buildInputs = with pkgs; [
             udev
           ];
@@ -70,6 +70,10 @@
             lld
             binaryen
             sqlx-cli
+            # Temporal SDK build (protoc), and the local stack for scripts/ci-test.sh and scripts/dev-stack.sh
+            protobuf
+            postgresql_17
+            temporal-cli
           ] ++ buildInputsAll;
           RUST_SRC_PATH = rustPlatform.rustLibSrc;
           LD_LIBRARY_PATH = lib.makeLibraryPath buildInputsAll;
