@@ -196,8 +196,8 @@ terminated) rebuilds its directory from the running game-server workflows before
 anyone. The coordinator continues as new every hour or 2000 events (checked on every wake)
 and has a 3 h run timeout; a game-server workflow continues as new hourly and has a 24 h run
 timeout. A session ends at logout, or 24 h after it started once none of its characters is in
-game, and at the latest after 48 h. The task queue is part of every ID because all previews
-share the `rots-preview` namespace.
+game, and at the latest after `SESSION_EXECUTION_TIMEOUT_SECS` (48 h; previews 2 h). The
+task queue is part of every ID because all previews share the `rots-preview` namespace.
 
 Workflow code changes that are not replay-compatible need the affected running workflows
 terminated after the rollout; the next `/play` and report recreate them (static game-server

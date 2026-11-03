@@ -76,6 +76,7 @@ fn config(temporal_address: Option<String>) -> Config {
         game_server_unschedulable_secs: 30,
         game_udp_port_base: 25555,
         coordinator_stale_secs: 2,
+        session_execution_timeout_secs: 48 * 3600,
         ..Default::default()
     }
 }
@@ -759,6 +760,43 @@ async fn logout_ends_session(db: PgPool) {
         }
     })
     .await;
+}
+
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn session_execution_timeout_comes_from_config(db: PgPool) {
+    let config = Config {
+        session_execution_timeout_secs: 7200,
+        ..config(Some(temporal_address()))
+    };
+    let st = build_state(config, db).await.unwrap();
+    let _worker = temporal::start_worker(st.clone());
+    eventually("worker connected", Duration::from_secs(15), || {
+        let st = st.clone();
+        async move { temporal::is_connected(&st) }
+    })
+    .await;
+    let _s0 = FakeServer::start(&st, 0, "a", &[]);
+    slots_up(&st, &[0]).await;
+    let token = guest(&st).await;
+    let (_, body) = play(&st, &token).await;
+    let (_, sid) = who(&body);
+    let client = temporal::client(&st).unwrap();
+    let d = client
+        .get_workflow_handle::<PlayerSessionWorkflow>(temporal::session_id(
+            &st.config.temporal_task_queue,
+            &sid,
+        ))
+        .describe(WorkflowDescribeOptions::default())
+        .await
+        .unwrap();
+    let timeout = d
+        .raw_description
+        .execution_config
+        .as_ref()
+        .and_then(|c| c.workflow_execution_timeout.as_ref())
+        .map(|t| t.seconds);
+    assert_eq!(timeout, Some(7200));
 }
 
 #[sqlx::test]

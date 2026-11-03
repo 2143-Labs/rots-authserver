@@ -321,7 +321,9 @@ pub async fn play(st: &AppState, s: &SessionRow) -> Result<PlayOutcome, ApiError
         WorkflowIdConflictPolicy::UseExisting,
     )
     .id_reuse_policy(WorkflowIdReusePolicy::AllowDuplicate)
-    .execution_timeout(session::EXECUTION_TIMEOUT)
+    .execution_timeout(Duration::from_secs(
+        st.config.session_execution_timeout_secs,
+    ))
     .build();
     let call = client.execute_update_with_start_workflow(
         PlayerSessionWorkflow::run,
@@ -361,7 +363,9 @@ pub async fn server_crashed(st: &AppState, s: &SessionRow) {
         WorkflowIdConflictPolicy::UseExisting,
     )
     .id_reuse_policy(WorkflowIdReusePolicy::AllowDuplicate)
-    .execution_timeout(session::EXECUTION_TIMEOUT)
+    .execution_timeout(Duration::from_secs(
+        st.config.session_execution_timeout_secs,
+    ))
     .build();
     let call = client.execute_update_with_start_workflow(
         PlayerSessionWorkflow::run,

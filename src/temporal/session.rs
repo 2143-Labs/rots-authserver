@@ -20,8 +20,6 @@ use super::coordinator::{CrashedIn, PlaceIn, Placement};
 
 /// A session with nobody in game ends after this long; the next `/play` starts a new run.
 pub const IDLE_SECS: u64 = 24 * 3600;
-/// Closes sessions of a deleted preview that has no worker left.
-pub const EXECUTION_TIMEOUT: Duration = Duration::from_secs(48 * 3600);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SessionArgs {
