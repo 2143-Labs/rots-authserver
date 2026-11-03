@@ -15,8 +15,8 @@ use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 
 use super::coordinator::{
-    ClaimIn, CoordinatorWorkflow, JoinOutcome, Phase, PlaceIn, Placement, ReleaseIn, ServerGoneIn,
-    ServerReport, ShutdownIn, ShutdownPlan,
+    ClaimIn, CoordinatorWorkflow, CrashedIn, InstanceRef, JoinOutcome, Phase, PlaceIn, Placement,
+    ReleaseIn, ServerGoneIn, ServerReport, ShutdownIn, ShutdownPlan,
 };
 use super::server::{GameServerWorkflow, ServerInfo};
 use crate::api::AppState;
@@ -63,6 +63,19 @@ impl SessionActivities {
         input: PlaceIn,
     ) -> Result<Placement, ActivityError> {
         Ok(super::coordinator_update(&self.state, CoordinatorWorkflow::place, input).await?)
+    }
+
+    /// Tells the coordinator a client lost the character's server.
+    #[activity]
+    pub async fn report_crash(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: CrashedIn,
+    ) -> Result<bool, ActivityError> {
+        Ok(
+            super::coordinator_update(&self.state, CoordinatorWorkflow::server_crashed, input)
+                .await?,
+        )
     }
 
     /// Signs a ticket bound to `slot` for the character.
@@ -117,6 +130,15 @@ pub enum InstanceHealth {
     Unschedulable,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeResult {
+    /// `/healthz` answered 200.
+    Alive,
+    /// No pod, no pod IP, or no 200 within 2 s.
+    Dead,
+}
+
 /// A game-server workflow's report to the coordinator.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum CoordinatorReport {
@@ -124,6 +146,7 @@ pub enum CoordinatorReport {
     Status(ServerReport),
     Release(ReleaseIn),
     Gone(ServerGoneIn),
+    Recovering(InstanceRef),
 }
 
 /// What the fake provisioner was asked to do, in order.
@@ -131,6 +154,8 @@ pub enum CoordinatorReport {
 pub enum FakeCall {
     Provision(InstanceIn),
     Delete(InstanceIn),
+    Probe(InstanceIn),
+    Kill(InstanceIn),
 }
 
 pub struct GameServerActivities {
@@ -309,6 +334,64 @@ impl GameServerActivities {
         }
     }
 
+    /// GETs the server's `/healthz` (2 s timeout).
+    #[activity]
+    pub async fn probe_server(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: InstanceIn,
+    ) -> Result<ProbeResult, ActivityError> {
+        match self.kind() {
+            ProvisionerKind::Static => {
+                // The chart's per-slot Service exposes the health port.
+                let url = format!("http://rots-gs-{}:25566/healthz", input.slot);
+                Ok(k8s::healthz(&self.state.http, &url).await)
+            }
+            ProvisionerKind::Fake => {
+                self.state
+                    .fake_calls
+                    .lock()
+                    .expect("fake calls lock poisoned")
+                    .push(FakeCall::Probe(input));
+                Ok(
+                    if self
+                        .state
+                        .fake_alive
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        ProbeResult::Alive
+                    } else {
+                        ProbeResult::Dead
+                    },
+                )
+            }
+            ProvisionerKind::Kubernetes => {
+                Ok(k8s::probe(self.kube()?, &self.state.http, &input).await?)
+            }
+        }
+    }
+
+    /// Force-deletes the instance's pod; its StatefulSet recreates it on the same PVC.
+    #[activity]
+    pub async fn kill_pod(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: InstanceIn,
+    ) -> Result<(), ActivityError> {
+        match self.kind() {
+            ProvisionerKind::Static => Ok(()),
+            ProvisionerKind::Fake => {
+                self.state
+                    .fake_calls
+                    .lock()
+                    .expect("fake calls lock poisoned")
+                    .push(FakeCall::Kill(input));
+                Ok(())
+            }
+            ProvisionerKind::Kubernetes => Ok(k8s::kill_pod(self.kube()?, &input).await?),
+        }
+    }
+
     #[activity]
     pub async fn claim_character(
         self: Arc<Self>,
@@ -349,6 +432,9 @@ impl GameServerActivities {
             }
             CoordinatorReport::Gone(r) => {
                 super::coordinator_signal(st, CoordinatorWorkflow::server_gone, r).await?
+            }
+            CoordinatorReport::Recovering(r) => {
+                super::coordinator_signal(st, CoordinatorWorkflow::server_recovering, r).await?
             }
         }
         Ok(())

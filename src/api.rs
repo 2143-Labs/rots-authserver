@@ -33,6 +33,8 @@ pub struct AppState {
     pub temporal: TemporalSlot,
     /// What the fake provisioner (`GAME_SERVER_PROVISIONER=fake`) was asked to do.
     pub fake_calls: Arc<std::sync::Mutex<Vec<temporal::activities::FakeCall>>>,
+    /// What the fake provisioner's probe answers (true = alive).
+    pub fake_alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The gateway strips `/auth`, so these are served at the root.
@@ -43,6 +45,7 @@ pub fn create_api(state: AppState) -> Router {
         .route("/guest", post(create_guest))
         .route("/me", get(me))
         .route("/play", post(play))
+        .route("/my-server-crashed", post(my_server_crashed))
         .route("/steam/ticket", post(steam_ticket_login))
         .route("/steam/callback", get(steam_callback))
         .route("/{provider}/login", get(provider_login))
@@ -318,6 +321,17 @@ async fn play(
             Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
         }
     }
+}
+
+/// The client lost its game server (no heartbeat for 10 s and no answer to reconnects):
+/// the coordinator probes the character's instance. Always 202; the client polls `/play`.
+async fn my_server_crashed(
+    State(st): State<AppState>,
+    Session(session): Session,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let s = session.ok_or_else(ApiError::no_session)?;
+    temporal::server_crashed(&st, &s).await;
+    Ok((StatusCode::ACCEPTED, Json(json!({ "status": "accepted" }))))
 }
 
 #[derive(Deserialize)]

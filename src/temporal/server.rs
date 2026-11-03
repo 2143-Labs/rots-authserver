@@ -9,6 +9,13 @@
 //! start their workflow themselves: the internal API signals-with-start it on every
 //! heartbeat, so a static server that went silent and came back gets a new run.
 //!
+//! When the lease lapses, or a client reports the server crashed, the workflow probes
+//! the server's `/healthz` before anything else: an answer re-arms the lease and kills
+//! nothing, so an authserver outage cannot take the fleet down. A managed server that
+//! does not answer has its pod deleted (at most once per [`KILL_BACKOFF_SECS`]); the
+//! StatefulSet recreates it on the same volume and the new process restores the world
+//! from its statefile. A static server that does not answer is reported lost.
+//!
 //! The rules are pure [`ServerState`] methods that take `now`; the run loop sleeps
 //! until [`ServerState::next_wake`] or until there is something to send.
 use std::collections::BTreeMap;
@@ -23,12 +30,12 @@ use temporalio_sdk::{
 };
 
 use super::activities::{
-    CoordinatorReport, GameServerActivities, InstanceHealth, InstanceIn, ProvisionOutcome,
-    ProvisionerKind,
+    CoordinatorReport, GameServerActivities, InstanceHealth, InstanceIn, ProbeResult,
+    ProvisionOutcome, ProvisionerKind,
 };
 use super::coordinator::{
-    ClaimIn, GoneReason, JoinOutcome, MAX_HISTORY, Phase, PlayerRef, RUN_SECS, ReleaseIn,
-    ServerGoneIn, ServerReport, ShutdownIn, ShutdownPlan, ShutdownReason,
+    ClaimIn, GoneReason, InstanceRef, JoinOutcome, MAX_HISTORY, Phase, PlayerRef, RUN_SECS,
+    ReleaseIn, ServerGoneIn, ServerReport, ShutdownIn, ShutdownPlan, ShutdownReason,
 };
 use super::session::{PlayerSessionWorkflow, PresenceIn};
 use super::{now_secs, session_id};
@@ -43,6 +50,9 @@ pub const INSTANCE_CHECK_SECS: u64 = 10;
 /// exits on its own first; `to_menu` gives clients up to 10 s to leave).
 pub const DESTROY_GRACE_SECS: u64 = 5;
 pub const TO_MENU_GRACE_SECS: u64 = 15;
+/// A server's pod is killed at most this often; a dead server inside the window is
+/// probed again on the next lapse instead.
+pub const KILL_BACKOFF_SECS: u64 = 300;
 
 fn one() -> u64 {
     1
@@ -146,10 +156,17 @@ pub struct ServerState {
     /// heartbeat of a boot adds players (rebuilding after a restart of this workflow);
     /// later ones only remove, because a roster can list a join that was refused.
     pub adopted: bool,
-    /// Renewed by every heartbeat to `now + stale_secs`. The instance counts as gone one
-    /// more `stale_secs` after it lapses ([`ServerState::gone_after`]), so a restart of
-    /// the authserver (which delivers the heartbeats) costs nothing.
+    /// Renewed by every heartbeat to `now + stale_secs`; a lapse triggers a probe.
     pub lease_until: u64,
+    /// A client reported the server crashed (via the coordinator's `probe` signal).
+    #[serde(default)]
+    pub probe_requested: bool,
+    /// When this instance's pod was last killed (0 = never).
+    #[serde(default)]
+    pub last_kill: u64,
+    /// While recovering: the restarted process must heartbeat by then.
+    #[serde(default)]
+    pub recover_deadline: u64,
     pub ready_deadline: u64,
     pub next_check: u64,
     /// When the provisioning pod was first seen unschedulable (or missing).
@@ -171,6 +188,9 @@ impl ServerState {
             roster: BTreeMap::new(),
             adopted: false,
             lease_until: 0,
+            probe_requested: false,
+            last_kill: 0,
+            recover_deadline: 0,
             ready_deadline: now + args.ready_timeout_secs,
             next_check: now + INSTANCE_CHECK_SECS,
             unschedulable_since: None,
@@ -240,14 +260,12 @@ impl ServerState {
         }
     }
 
-    /// A new process on this instance: its predecessor's players are gone.
-    pub fn observe_boot(&mut self, args: &GameServerArgs, boot_id: &str) {
+    /// A new process on this instance. Its first heartbeat says who is still in the
+    /// world: a process restored from its statefile lists its ghosts, a fresh one lists
+    /// nobody, and everyone unlisted is released then.
+    pub fn observe_boot(&mut self, boot_id: &str) {
         if self.boot_id.as_deref() == Some(boot_id) {
             return;
-        }
-        let old: Vec<i64> = self.roster.keys().copied().collect();
-        for c in old {
-            self.drop_player(args, c);
         }
         self.boot_id = Some(boot_id.to_owned());
         self.adopted = false;
@@ -258,7 +276,8 @@ impl ServerState {
         if self.phase == Phase::Draining {
             return;
         }
-        self.observe_boot(args, &input.boot_id);
+        self.observe_boot(&input.boot_id);
+        self.probe_requested = false;
         let listed: BTreeMap<i64, &str> = input
             .players
             .iter()
@@ -359,15 +378,46 @@ impl ServerState {
                 self.ready_deadline.min(self.next_check)
             }
             Phase::Provisioning => self.ready_deadline,
-            Phase::Ready | Phase::Recovering => self.gone_after(args).min(self.next_status),
+            // A requested probe is due now (0); otherwise at the lapse.
+            Phase::Ready if self.probe_requested => 0,
+            Phase::Ready => self.lease_until.min(self.next_status),
+            Phase::Recovering => self.recover_deadline,
             Phase::Draining => self.destroy_at,
         }
     }
 
-    /// When an instance without heartbeats counts as gone: two stale windows after the
-    /// last one.
-    pub fn gone_after(&self, args: &GameServerArgs) -> u64 {
-        self.lease_until + args.stale_secs
+    /// The probe's answer; returns what to do with the server.
+    pub fn probed(&mut self, args: &GameServerArgs, result: ProbeResult, now: u64) -> AfterProbe {
+        self.probe_requested = false;
+        match result {
+            ProbeResult::Alive => {
+                self.lease_until = now + args.stale_secs;
+                AfterProbe::Keep
+            }
+            ProbeResult::Dead if args.provisioner == ProvisionerKind::Static => AfterProbe::Lost,
+            ProbeResult::Dead
+                if self.last_kill != 0 && now < self.last_kill + KILL_BACKOFF_SECS =>
+            {
+                // Killed recently: let the pod's own restarts work, look again next lapse.
+                self.lease_until = now + args.stale_secs;
+                AfterProbe::Keep
+            }
+            ProbeResult::Dead => AfterProbe::Kill,
+        }
+    }
+
+    /// The pod was deleted; the StatefulSet recreates it on the same volume.
+    pub fn killed(&mut self, args: &GameServerArgs, now: u64) {
+        self.phase = Phase::Recovering;
+        self.last_kill = now;
+        self.recover_deadline = now + args.ready_timeout_secs;
+        self.outbox
+            .push(ServerEffect::Report(CoordinatorReport::Recovering(
+                InstanceRef {
+                    slot: args.slot,
+                    generation: args.generation,
+                },
+            )));
     }
 
     /// The instance is gone: its players leave and the coordinator frees the slot.
@@ -386,12 +436,21 @@ impl ServerState {
     }
 }
 
+/// What to do with a server after probing it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AfterProbe {
+    Keep,
+    Kill,
+    Lost,
+}
+
 /// What the run loop has to do after waking at `now`.
 #[derive(Debug, PartialEq)]
 enum Due {
     Nothing,
     CheckInstance,
     SendStatus,
+    Probe,
     End { delete: bool, reason: GoneReason },
 }
 
@@ -412,7 +471,8 @@ fn due(state: &ServerState, args: &GameServerArgs, now: u64) -> Due {
         {
             Due::CheckInstance
         }
-        Phase::Ready | Phase::Recovering if now >= state.gone_after(args) => Due::End {
+        Phase::Ready if state.probe_requested || now >= state.lease_until => Due::Probe,
+        Phase::Recovering if now >= state.recover_deadline => Due::End {
             delete: managed,
             reason: GoneReason::Lost,
         },
@@ -615,6 +675,40 @@ impl GameServerWorkflow {
                         return end(ctx, true, GoneReason::ServersFull).await;
                     }
                 }
+                Due::Probe => {
+                    let instance = ctx.state(|s| s.instance());
+                    let result = ctx
+                        .execute_local_activity(
+                            GameServerActivities::probe_server,
+                            instance.clone(),
+                            la(10, 2),
+                        )
+                        .await
+                        // A probe that cannot run says nothing about the server.
+                        .unwrap_or(ProbeResult::Alive);
+                    let now = now_secs(ctx.workflow_time());
+                    match ctx.state_mut(|s| s.state.probed(&s.args, result, now)) {
+                        AfterProbe::Keep => {}
+                        AfterProbe::Lost => return end(ctx, false, GoneReason::Lost).await,
+                        AfterProbe::Kill => {
+                            if let Err(e) = ctx
+                                .execute_local_activity(
+                                    GameServerActivities::kill_pod,
+                                    instance.clone(),
+                                    la(30, 3),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    ?instance,
+                                    "game-server workflow: kill failed: {e}"
+                                );
+                            }
+                            let now = now_secs(ctx.workflow_time());
+                            ctx.state_mut(|s| s.state.killed(&s.args, now));
+                        }
+                    }
+                }
                 Due::End { delete, reason } => return end(ctx, delete, reason).await,
             }
             // Checked on every wake, not only when the timer fires.
@@ -642,9 +736,18 @@ impl GameServerWorkflow {
             .heartbeat(&self.args, &input, now_secs(ctx.workflow_time()));
     }
 
+    /// The character's units left the world (death); a disconnect leaves a ghost.
     #[signal]
     pub fn leave(&mut self, _ctx: &mut SyncWorkflowContext<Self>, input: LeaveIn) {
         self.state.leave(&self.args, &input);
+    }
+
+    /// A client reported this server crashed: probe it now.
+    #[signal]
+    pub fn probe(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _input: ()) {
+        if self.state.phase == Phase::Ready {
+            self.state.probe_requested = true;
+        }
     }
 
     /// Claims the character at the coordinator, then records it here.
@@ -654,7 +757,7 @@ impl GameServerWorkflow {
             if s.state.phase == Phase::Draining {
                 return Err(JoinOutcome::ServerDraining);
             }
-            s.state.observe_boot(&s.args, &input.boot_id);
+            s.state.observe_boot(&input.boot_id);
             Ok(ClaimIn {
                 slot: s.args.slot,
                 generation: s.args.generation,
@@ -785,18 +888,12 @@ mod tests {
         s.heartbeat(&a, &hb("b", &[], 0), 1050);
         assert_eq!(s.phase, Phase::Ready);
         assert!(matches!(reports(&s)[..], [CoordinatorReport::Ready(_)]));
-        assert_eq!(s.next_wake(&a), 1110);
-        assert_eq!(due(&s, &a, 1109), Due::Nothing);
+        assert_eq!(s.next_wake(&a), 1080);
+        assert_eq!(due(&s, &a, 1079), Due::Nothing);
         s.heartbeat(&a, &hb("b", &[], 0), 1060);
         assert_eq!(reports(&s).len(), 1, "no change, no status");
-        assert_eq!(s.next_wake(&a), 1120);
-        assert_eq!(
-            due(&s, &a, 1120),
-            Due::End {
-                delete: true,
-                reason: GoneReason::Lost
-            }
-        );
+        assert_eq!(s.next_wake(&a), 1090);
+        assert_eq!(due(&s, &a, 1090), Due::Probe);
         // Static: never deleted, and a silent start is lost rather than failed.
         let st = args(ProvisionerKind::Static);
         let s = ServerState::new(&st, 1000);
@@ -807,6 +904,73 @@ mod tests {
                 delete: false,
                 reason: GoneReason::Lost
             }
+        );
+    }
+
+    #[test]
+    fn lease_expiry_probes_before_killing() {
+        let a = args(ProvisionerKind::Kubernetes);
+        let mut s = ServerState::new(&a, 0);
+        s.heartbeat(&a, &hb("b", &[(1, "s1")], 1), 10);
+        s.outbox.clear();
+        assert_eq!(due(&s, &a, 40), Due::Probe);
+        // It answers: nothing is killed and the lease is re-armed.
+        assert_eq!(s.probed(&a, ProbeResult::Alive, 40), AfterProbe::Keep);
+        assert_eq!((s.phase, s.lease_until), (Phase::Ready, 70));
+        assert!(s.outbox.is_empty());
+        // It does not: kill, then wait for the restarted process.
+        assert_eq!(s.probed(&a, ProbeResult::Dead, 70), AfterProbe::Kill);
+        s.killed(&a, 70);
+        assert_eq!(s.phase, Phase::Recovering);
+        assert!(matches!(
+            reports(&s)[..],
+            [CoordinatorReport::Recovering(_)]
+        ));
+        assert_eq!(s.next_wake(&a), 70 + 120);
+        // The new process restored its world: the ghost stays on the roster.
+        s.outbox.clear();
+        s.heartbeat(&a, &hb("c", &[(1, "s1")], 0), 80);
+        assert_eq!(s.phase, Phase::Ready);
+        assert!(s.roster.contains_key(&1));
+        assert!(matches!(reports(&s)[..], [CoordinatorReport::Ready(_)]));
+        // No restart in time: lost.
+        let mut t = ServerState::new(&a, 0);
+        t.heartbeat(&a, &hb("b", &[], 0), 10);
+        t.killed(&a, 50);
+        assert_eq!(
+            due(&t, &a, 170),
+            Due::End {
+                delete: true,
+                reason: GoneReason::Lost
+            }
+        );
+        // A crash report probes at once; a static server that does not answer is lost.
+        let st = args(ProvisionerKind::Static);
+        let mut u = ServerState::new(&st, 0);
+        u.heartbeat(&st, &hb("b", &[], 0), 10);
+        u.probe_requested = true;
+        assert_eq!(u.next_wake(&st), 0);
+        assert_eq!(due(&u, &st, 11), Due::Probe);
+        assert_eq!(u.probed(&st, ProbeResult::Dead, 11), AfterProbe::Lost);
+    }
+
+    #[test]
+    fn kill_backoff_blocks_a_second_kill_within_300s() {
+        let a = args(ProvisionerKind::Kubernetes);
+        let mut s = ServerState::new(&a, 0);
+        s.heartbeat(&a, &hb("b", &[], 0), 10);
+        assert_eq!(s.probed(&a, ProbeResult::Dead, 40), AfterProbe::Kill);
+        s.killed(&a, 40);
+        s.heartbeat(&a, &hb("c", &[], 0), 50);
+        assert_eq!(s.probed(&a, ProbeResult::Dead, 80), AfterProbe::Keep);
+        assert_eq!(s.lease_until, 110, "probed again next lapse");
+        assert_eq!(
+            s.probed(&a, ProbeResult::Dead, 40 + KILL_BACKOFF_SECS - 1),
+            AfterProbe::Keep
+        );
+        assert_eq!(
+            s.probed(&a, ProbeResult::Dead, 40 + KILL_BACKOFF_SECS),
+            AfterProbe::Kill
         );
     }
 
@@ -856,7 +1020,7 @@ mod tests {
                 ..
             })]
         ));
-        // A new boot drops everyone from the old one.
+        // A new boot that lists nobody drops everyone from the old one.
         s.outbox.clear();
         s.heartbeat(&a, &hb("c", &[], 0), 3);
         assert!(s.roster.is_empty());

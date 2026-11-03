@@ -71,7 +71,7 @@ unset.
 | `GAME_SERVER_UNSCHEDULABLE_SECS` | `30` | A spawned instance whose pod cannot be scheduled for this long is deleted, and `/play` answers `servers_full` for 30 s. |
 | `GAME_UDP_HOST` | host of `PUBLIC_URL` | Host in `/play`'s `server.udp`. |
 | `GAME_UDP_PORT_BASE` | `25555` | Slot N's UDP port is this + N. |
-| `COORDINATOR_STALE_SECS` | `30` | A game server's lease: one heartbeat renews it for this long. With no heartbeat for twice this long the server counts as gone (a managed instance is deleted). |
+| `COORDINATOR_STALE_SECS` | `30` | A game server's lease: one heartbeat renews it for this long. When it lapses the server's `/healthz` is probed: an answer re-arms the lease; no answer kills a managed instance's pod (it restarts on the same volume) or ends a static server's workflow. |
 | `RUST_LOG` | `info` | tracing filter. |
 
 When each provider is enabled:
@@ -101,6 +101,7 @@ first, then from `Authorization: Bearer <token>`.
 | `POST /api/v1/guest` | `{"client":"web"\|"native"}` | `{"character_id","claim_code","session_token"?}`. Creates a new guest character `Guest-<id>`. | 400 `bad_client` |
 | `GET /api/v1/me` | session | `{"kind":"guest"\|"account","character_id","character_name","account_id"?,"display_name"?,"claim_code"?}` | 401 `no_session` |
 | `POST /api/v1/play` | session | `{"ticket","expires_at","character_id","kind","server":{"slot","udp","ws_path","join_code","paused"}}`. The ticket is valid only on that slot. `join_code` is the instance's code (managed instances) or `null`. | 401 `no_session`, 409 `play_in_progress`, 503 `server_starting`, 503 `server_recovering`, 503 `servers_full`, 503 `no_game_server`, 503 `temporal_unavailable`, 500 `internal` |
+| `POST /api/v1/my-server-crashed` | session, body `{}` | 202 `{"status":"accepted"}`. The client lost its game server: the coordinator probes the character's instance. The client then polls `/play`, which answers `server_recovering` while the instance restarts. | 401 `no_session` |
 | `POST /api/v1/steam/ticket` | `{"steam_ticket_hex","client"}`, plus an optional guest session | `{"session_token"?,"character_id"}`. The ticket identity must be `rots-auth`. | 503 `provider_unavailable`, 401 `steam_ticket_rejected`, 400 `bad_request` |
 | `GET /api/v1/{steam,discord,au2143}/login?return_to=/path` | optional cookie session | 302 to the provider | 404 `provider_disabled`, 400 `bad_return_to` |
 | `GET /api/v1/steam/callback` | OpenID params, `state` | 302 to `{PUBLIC_URL}{return_to}`, sets the cookie | 302 to `{PUBLIC_URL}/?login_error=<code>` |
@@ -161,13 +162,13 @@ a join answered.
 |---|---|---|---|
 | `POST /internal/v1/servers/heartbeat` | `{"slot","generation","boot_id","players":[{"character_id","sid"}],"connected","paused","udp_port"}`, every 10 s | 204 | 409 `unknown_instance`, 503 `temporal_unavailable` |
 | `POST /internal/v1/servers/join` | `{"slot","generation","boot_id","character_id","sid"}`, before admitting a player | 200 `{"result":"admitted"}` | 409 `session_ended`, 409 `already_on_other_server`, 409 `server_draining`, 409 `unknown_instance`, 503 `db_unavailable`, 503 `temporal_unavailable` |
-| `POST /internal/v1/servers/leave` | `{"slot","generation","boot_id","character_id"}` | 204 | 409 `unknown_instance` (managed only), 503 `temporal_unavailable` |
+| `POST /internal/v1/servers/leave` | `{"slot","generation","boot_id","character_id"}`, when the character's units leave the world (death); a disconnect leaves them in the world | 204 | 409 `unknown_instance` (managed only), 503 `temporal_unavailable` |
 | `POST /internal/v1/servers/shutdown-request` | `{"slot","generation","boot_id","reason":"idle"\|"sigterm","players":[character_id]}`, when the server decides to shut down | 200 `{"plan":"destroy"}` (exit) or `{"plan":"to_menu"}` (send every client to the menu, then exit) | 409 `unknown_instance`, 503 `temporal_unavailable` |
 
 Every route also answers 401 `bad_coordinator_token`, 400 `bad_slot` (slot not below
 `GAME_SERVER_SLOTS`) and 400 `bad_request` (malformed JSON).
 - `generation` identifies the instance on its slot; servers that omit it are generation 1. `connected` (default: the roster size), `paused` and `udp_port` are optional; `udp_port` becomes `/play`'s `server.udp` port.
-- `boot_id` is random per game-server process. A new one for an instance clears its players.
+- `boot_id` is random per game-server process. The first heartbeat of a new one sets the instance's roster: a process restored from its statefile lists its disconnected characters (ghosts), and everyone unlisted is released.
 - `players` is the full roster, pending joins included. For a known `boot_id` it only removes players; the first heartbeat from an unknown slot adopts it, which is how a coordinator that lost its state recovers.
 - A join is refused with `session_ended` when the ticket's session (`sid`) no longer exists: logged out, replaced by a new login, removed by a claim, or expired. Players already in game are not re-checked.
 - A game server must send its reports in order, one at a time: dropping players missing from a roster is only correct because a join always arrives before the heartbeat that lists it.
@@ -180,12 +181,17 @@ is unreachable; `/ready` answers 503 until it is connected. Each environment has
 | Workflow | ID | Started by | State |
 |---|---|---|---|
 | Coordinator | `rots-coordinator-{TEMPORAL_TASK_QUEUE}` | the first `/play` or instance report | directory (slot → generation, phase, join code, UDP port), character index (character → instance), reservations, spawn back-off |
-| Game server | `rots-gs-{TEMPORAL_TASK_QUEUE}-{slot}-g{generation}` | the coordinator's spawn (managed), or the server's first report (static) | lease, roster, phase (`provisioning` / `ready` / `draining`) |
+| Game server | `rots-gs-{TEMPORAL_TASK_QUEUE}-{slot}-g{generation}` | the coordinator's spawn (managed), or the server's first report (static) | lease, roster, phase (`provisioning` / `ready` / `recovering` / `draining`), last kill |
 | Session | `rots-session-{TEMPORAL_TASK_QUEUE}-{sid}` | the session's first `/play` | assigned slot, presence, `in_menus` / `assigned` / `in_game` / `ended` |
 
 Heartbeats only reach the game-server workflow, which reports `server_ready`,
-`server_status` (on change, and every 300 s), `release` and `server_gone` to the coordinator,
-and presence to sessions. A coordinator started without state (first start, or after it was
+`server_status` (on change, and every 300 s), `release`, `server_recovering` and
+`server_gone` to the coordinator, and presence to sessions. When its lease lapses, or a
+client's `/my-server-crashed` reaches it through the coordinator, it probes the server's
+`/healthz` (2 s) before anything else: an answer re-arms the lease and nothing is killed, so
+an authserver outage cannot take the fleet down. A managed instance that does not answer
+has its pod deleted (at most once per 300 s) and is `recovering` until its restarted process
+heartbeats, or is deleted after `GAME_SERVER_READY_TIMEOUT_SECS`. A coordinator started without state (first start, or after it was
 terminated) rebuilds its directory from the running game-server workflows before it places
 anyone. The coordinator continues as new every hour or 2000 events (checked on every wake)
 and has a 3 h run timeout; a game-server workflow continues as new hourly and has a 24 h run
@@ -193,11 +199,13 @@ timeout. A session ends at logout, or 24 h after it started once none of its cha
 game, and at the latest after 48 h. The task queue is part of every ID because all previews
 share the `rots-preview` namespace.
 
-Workflow code changes that are not replay-compatible (this release's coordinator and session)
-need the running coordinator and sessions terminated after the rollout; the next `/play` and
-report recreate them:
+Workflow code changes that are not replay-compatible need the affected running workflows
+terminated after the rollout; the next `/play` and report recreate them (static game-server
+workflows on their next heartbeat). Terminate game-server workflows before the coordinator,
+which rebuilds its directory from them:
 
 ```
+temporal workflow terminate --namespace <ns> --query "WorkflowType='GameServerWorkflow' AND TaskQueue='<queue>' AND ExecutionStatus='Running'" --reason <why>
 temporal workflow terminate --namespace <ns> -w rots-coordinator-<queue> --reason <why>
 temporal workflow terminate --namespace <ns> --query "WorkflowType='PlayerSessionWorkflow' AND TaskQueue='<queue>' AND ExecutionStatus='Running'" --reason <why>
 ```
