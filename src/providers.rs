@@ -301,6 +301,53 @@ pub async fn verify_openid(
     steam_id.parse::<u64>().context("invalid steam id")
 }
 
+const STEAM_TICKET_URL: &str =
+    "https://partner.steam-api.com/ISteamUserAuth/AuthenticateUserTicket/v1/";
+
+/// AuthenticateUserTicket is GET-only (a POST answers 405). The key goes in the
+/// x-webapi-key header so it never appears in a URL; the ticket and identity are query
+/// parameters, as the method requires.
+fn ticket_request(
+    http: &reqwest::Client,
+    api_key: &str,
+    app_id: u32,
+    ticket_hex: &str,
+    identity: &str,
+) -> anyhow::Result<reqwest::Request> {
+    let app_id = app_id.to_string();
+    let url = reqwest::Url::parse_with_params(
+        STEAM_TICKET_URL,
+        [
+            ("appid", app_id.as_str()),
+            ("ticket", ticket_hex),
+            ("identity", identity),
+        ],
+    )?;
+    Ok(http.get(url).header("x-webapi-key", api_key).build()?)
+}
+
+/// The SteamID64 of an AuthenticateUserTicket response, or Steam's error.
+fn ticket_steam_id(json: &serde_json::Value) -> anyhow::Result<u64> {
+    let error = &json["response"]["error"];
+    if error.is_object() {
+        let field = |name: &str| match &error[name] {
+            serde_json::Value::Null => "?".to_owned(),
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        bail!(
+            "ticket rejected: Steam error {}: {}",
+            field("errorcode"),
+            field("errordesc")
+        );
+    }
+    json["response"]["params"]["steamid"]
+        .as_str()
+        .context("ticket rejected: no steamid in response")?
+        .parse::<u64>()
+        .context("invalid Steam identity")
+}
+
 /// Verify an in-game Web API ticket via Steam; returns the SteamID64.
 pub async fn verify_ticket(
     http: &reqwest::Client,
@@ -320,17 +367,8 @@ pub async fn verify_ticket(
         bail!("invalid ticket identity");
     }
 
-    // POST form fields so neither the ticket nor API key is embedded in a URL
-    // that an HTTP client error or proxy access log might disclose.
     let resp = http
-        .post("https://partner.steam-api.com/ISteamUserAuth/AuthenticateUserTicket/v1/")
-        .form(&[
-            ("key", api_key),
-            ("appid", &app_id.to_string()),
-            ("ticket", ticket_hex),
-            ("identity", identity),
-        ])
-        .send()
+        .execute(ticket_request(http, api_key, app_id, ticket_hex, identity)?)
         .await
         .map_err(|_| anyhow::anyhow!("ticket provider request failed"))?;
     if !resp.status().is_success() {
@@ -340,10 +378,7 @@ pub async fn verify_ticket(
         .json()
         .await
         .map_err(|_| anyhow::anyhow!("invalid ticket provider response"))?;
-    let steam_id = json["response"]["params"]["steamid"]
-        .as_str()
-        .context("ticket rejected")?;
-    steam_id.parse::<u64>().context("invalid Steam identity")
+    ticket_steam_id(&json)
 }
 
 #[cfg(test)]
@@ -445,5 +480,46 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "invalid ticket identity");
+    }
+
+    #[tokio::test]
+    async fn steam_ticket_request_is_a_get_with_the_key_in_a_header() {
+        let req = ticket_request(
+            &reqwest::Client::new(),
+            "KEY123",
+            4346770,
+            "0a0b",
+            "rots-auth",
+        )
+        .unwrap();
+        assert_eq!(req.method(), reqwest::Method::GET);
+        let url = req.url();
+        assert_eq!(url.host_str(), Some("partner.steam-api.com"));
+        assert_eq!(url.path(), "/ISteamUserAuth/AuthenticateUserTicket/v1/");
+        let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            query,
+            HashMap::from([
+                ("appid".to_owned(), "4346770".to_owned()),
+                ("identity".to_owned(), "rots-auth".to_owned()),
+                ("ticket".to_owned(), "0a0b".to_owned()),
+            ])
+        );
+        assert!(!url.as_str().contains("KEY123"));
+        assert_eq!(req.headers()["x-webapi-key"], "KEY123");
+    }
+
+    #[tokio::test]
+    async fn steam_ticket_response_yields_steamid_or_the_steam_error() {
+        let ok = serde_json::json!({"response":{"params":{"result":"OK","steamid":"76561198027378405"}}});
+        assert_eq!(ticket_steam_id(&ok).unwrap(), 76561198027378405);
+        let rejected =
+            serde_json::json!({"response":{"error":{"errorcode":101,"errordesc":"Invalid ticket"}}});
+        let err = ticket_steam_id(&rejected).unwrap_err().to_string();
+        assert!(
+            err.contains("101") && err.contains("Invalid ticket"),
+            "{err}"
+        );
+        assert!(ticket_steam_id(&serde_json::json!({})).is_err());
     }
 }
