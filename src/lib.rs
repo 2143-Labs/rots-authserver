@@ -94,6 +94,11 @@ pub struct Config {
     /// A game server with no report for this long is treated as dead.
     #[clap(long, default_value = "30", env)]
     pub coordinator_stale_secs: u64,
+    /// A login session's workflow ends after this long at the latest (Temporal execution
+    /// timeout), whatever its players do. Previews set 7200 so a deleted preview's sessions
+    /// do not wait out 48 h with no worker.
+    #[clap(long, default_value = "172800", env)]
+    pub session_execution_timeout_secs: u64,
 
     /// Do not actually run api requests
     #[clap(long, env)]
