@@ -1104,10 +1104,24 @@ async fn idle_shutdown_destroys_the_instance(db: PgPool) {
         }
     })
     .await;
+    // A coordinator that restarts now (a rollout) finds no running instance, but must
+    // still not reuse generation 1: that workflow id is taken by the closed instance.
+    temporal::client(&st)
+        .unwrap()
+        .get_workflow_handle::<CoordinatorWorkflow>(temporal::coordinator_id(
+            &st.config.temporal_task_queue,
+        ))
+        .terminate(WorkflowTerminateOptions::builder().reason("test").build())
+        .await
+        .unwrap();
     // The world is gone: the next play spawns a new instance on the freed slot.
     assert_eq!(play(&st, &token).await, starting());
     let calls = provisioned(&st, 2).await;
     assert_eq!((calls[1].slot, calls[1].generation), (0, 2));
+    assert_eq!(
+        instance_status(&st, 0, 2).await,
+        WorkflowExecutionStatus::Running
+    );
     let heartbeat = json!({"slot": 0, "generation": 1, "boot_id": "a", "players": []});
     assert_eq!(
         call(

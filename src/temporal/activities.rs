@@ -8,8 +8,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use temporalio_client::{
-    WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowListOptions, WorkflowQueryOptions,
-    WorkflowStartOptions, errors::WorkflowStartError,
+    WorkflowDescribeOptions, WorkflowExecutionStatus, WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy, WorkflowListOptions, WorkflowQueryOptions, WorkflowStartOptions,
+    errors::WorkflowStartError,
 };
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
@@ -178,6 +179,14 @@ impl GameServerActivities {
 }
 
 /// `(slot, generation)` from `rots-gs-<queue>-<slot>-g<generation>`.
+/// What a coordinator that starts without state learns from Temporal.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Rebuilt {
+    pub servers: Vec<ServerInfo>,
+    /// The highest generation of any instance workflow on the queue, closed or not.
+    pub max_generation: u64,
+}
+
 fn parse_server_id(queue: &str, id: &str) -> Option<(u32, u64)> {
     let rest = id.strip_prefix(&format!("rots-gs-{queue}-"))?;
     let (slot, generation) = rest.split_once("-g")?;
@@ -186,8 +195,10 @@ fn parse_server_id(queue: &str, id: &str) -> Option<(u32, u64)> {
 
 #[activities]
 impl GameServerActivities {
-    /// Starts the instance's workflow. Its id is unique per instance, so "already
-    /// started" means an earlier attempt got through.
+    /// Starts the instance's workflow. "Already started" is success only while that
+    /// workflow is running (an earlier attempt got through); a closed one means the
+    /// generation was used before, and the start fails rather than leaving the slot
+    /// waiting for an instance that does not exist.
     #[activity]
     pub async fn start_server_workflow(
         self: Arc<Self>,
@@ -210,30 +221,50 @@ impl GameServerActivities {
             .start_workflow(GameServerWorkflow::run, args, options)
             .await
         {
-            Ok(_) | Err(WorkflowStartError::AlreadyStarted { .. }) => Ok(()),
+            Ok(_) => Ok(()),
+            Err(WorkflowStartError::AlreadyStarted { .. }) => {
+                let id = super::server_id(&queue, input.slot, input.generation);
+                let running = client
+                    .get_workflow_handle::<GameServerWorkflow>(id.clone())
+                    .describe(WorkflowDescribeOptions::default())
+                    .await
+                    .is_ok_and(|d| d.status() == WorkflowExecutionStatus::Running);
+                if running {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("{id} was used by an earlier instance").into())
+                }
+            }
             Err(e) => Err(anyhow::anyhow!("starting the instance workflow: {e}").into()),
         }
     }
 
     /// The running instances of this queue, for a coordinator that starts without
-    /// state. An instance whose query does not answer quickly (its workflow may be
-    /// waiting on this very coordinator) is listed with an empty roster.
+    /// state, and the highest generation any instance (closed ones too) has used, so
+    /// the new coordinator never hands out an instance id that already exists. An
+    /// instance whose query does not answer quickly (its workflow may be waiting on
+    /// this very coordinator) is listed with an empty roster.
     #[activity]
     pub async fn rebuild_directory(
         self: Arc<Self>,
         _ctx: ActivityContext,
         _input: (),
-    ) -> Result<Vec<ServerInfo>, ActivityError> {
+    ) -> Result<Rebuilt, ActivityError> {
         let st = &self.state;
         let client = super::client(st).map_err(|_| anyhow::anyhow!("temporal unavailable"))?;
         let queue = &st.config.temporal_task_queue;
-        let query = format!(
-            "WorkflowType='GameServerWorkflow' AND ExecutionStatus='Running' AND TaskQueue='{queue}'"
-        );
+        let query = format!("WorkflowType='GameServerWorkflow' AND TaskQueue='{queue}'");
         let mut ids = Vec::new();
+        let mut max_generation = 0;
         let mut listing = client.list_workflows(query, WorkflowListOptions::default());
         while let Some(found) = listing.next().await {
-            ids.push(found.map_err(anyhow::Error::from)?.id().to_owned());
+            let found = found.map_err(anyhow::Error::from)?;
+            if let Some((_, generation)) = parse_server_id(queue, found.id()) {
+                max_generation = max_generation.max(generation);
+            }
+            if found.status() == WorkflowExecutionStatus::Running {
+                ids.push(found.id().to_owned());
+            }
         }
         let queries = ids.into_iter().map(|id| {
             let client = client.clone();
@@ -267,11 +298,15 @@ impl GameServerActivities {
                 }
             }
         });
-        Ok(futures::future::join_all(queries)
+        let servers = futures::future::join_all(queries)
             .await
             .into_iter()
             .flatten()
-            .collect())
+            .collect();
+        Ok(Rebuilt {
+            servers,
+            max_generation,
+        })
     }
 
     #[activity]
