@@ -164,6 +164,9 @@ pub struct ServerState {
     /// When this instance's pod was last killed (0 = never).
     #[serde(default)]
     pub last_kill: u64,
+    /// When the last heartbeat arrived (0 = never).
+    #[serde(default)]
+    pub last_heartbeat: u64,
     /// While recovering: the restarted process must heartbeat by then.
     #[serde(default)]
     pub recover_deadline: u64,
@@ -190,6 +193,7 @@ impl ServerState {
             lease_until: 0,
             probe_requested: false,
             last_kill: 0,
+            last_heartbeat: 0,
             recover_deadline: 0,
             ready_deadline: now + args.ready_timeout_secs,
             next_check: now + INSTANCE_CHECK_SECS,
@@ -273,6 +277,7 @@ impl ServerState {
 
     pub fn heartbeat(&mut self, args: &GameServerArgs, input: &HeartbeatIn, now: u64) {
         self.lease_until = now + args.stale_secs;
+        self.last_heartbeat = now;
         if self.phase == Phase::Draining {
             return;
         }
@@ -394,6 +399,16 @@ impl ServerState {
                 self.lease_until = now + args.stale_secs;
                 AfterProbe::Keep
             }
+            // Still heartbeating (within half a lease: 15 s in prod, where servers
+            // heartbeat every 10 s): the probe failed, not the server. One missed
+            // `/healthz` under node contention, or a crash report from a client whose own
+            // network dropped, must not kill a live world. The lease is left alone, so a
+            // real stop is probed again when it lapses.
+            ProbeResult::Dead
+                if self.last_heartbeat != 0 && now < self.last_heartbeat + args.stale_secs / 2 =>
+            {
+                AfterProbe::Keep
+            }
             ProbeResult::Dead if args.provisioner == ProvisionerKind::Static => AfterProbe::Lost,
             ProbeResult::Dead
                 if self.last_kill != 0 && now < self.last_kill + KILL_BACKOFF_SECS =>
@@ -422,9 +437,8 @@ impl ServerState {
 
     /// The instance is gone: its players leave and the coordinator frees the slot.
     pub fn finish(&mut self, args: &GameServerArgs, reason: GoneReason) {
-        for (c, sid) in std::mem::take(&mut self.roster) {
-            self.presence(sid, c, false);
-        }
+        // The coordinator unbinds first: a session that is back in the menus must not be
+        // placed on this instance again by a `/play` that runs in between.
         self.outbox
             .push(ServerEffect::Report(CoordinatorReport::Gone(
                 ServerGoneIn {
@@ -433,6 +447,9 @@ impl ServerState {
                     reason,
                 },
             )));
+        for (c, sid) in std::mem::take(&mut self.roster) {
+            self.presence(sid, c, false);
+        }
     }
 }
 
@@ -944,14 +961,57 @@ mod tests {
                 reason: GoneReason::Lost
             }
         );
-        // A crash report probes at once; a static server that does not answer is lost.
+        // A crash report probes at once; a static server that does not answer (and has
+        // stopped heartbeating) is lost.
         let st = args(ProvisionerKind::Static);
         let mut u = ServerState::new(&st, 0);
         u.heartbeat(&st, &hb("b", &[], 0), 10);
         u.probe_requested = true;
         assert_eq!(u.next_wake(&st), 0);
         assert_eq!(due(&u, &st, 11), Due::Probe);
-        assert_eq!(u.probed(&st, ProbeResult::Dead, 11), AfterProbe::Lost);
+        assert_eq!(u.probed(&st, ProbeResult::Dead, 30), AfterProbe::Lost);
+    }
+
+    #[test]
+    fn a_failed_probe_kills_nothing_while_heartbeats_are_fresh() {
+        let a = args(ProvisionerKind::Kubernetes);
+        let mut s = ServerState::new(&a, 0);
+        s.heartbeat(&a, &hb("b", &[], 0), 100);
+        // A client's crash report while the server still heartbeats.
+        s.probe_requested = true;
+        assert_eq!(s.probed(&a, ProbeResult::Dead, 105), AfterProbe::Keep);
+        assert_eq!(
+            (s.phase, s.lease_until),
+            (Phase::Ready, 130),
+            "lease untouched"
+        );
+        assert!(!s.probe_requested);
+        // A hung loop: the last heartbeat is older than the window.
+        assert_eq!(
+            s.probed(&a, ProbeResult::Dead, 100 + a.stale_secs / 2),
+            AfterProbe::Kill
+        );
+        // Static servers likewise are not reported lost while heartbeating.
+        let st = args(ProvisionerKind::Static);
+        let mut u = ServerState::new(&st, 0);
+        u.heartbeat(&st, &hb("b", &[], 0), 100);
+        assert_eq!(u.probed(&st, ProbeResult::Dead, 101), AfterProbe::Keep);
+    }
+
+    #[test]
+    fn gone_is_reported_before_players_leave() {
+        let a = args(ProvisionerKind::Static);
+        let mut s = ServerState::new(&a, 0);
+        s.heartbeat(&a, &hb("b", &[(1, "s1")], 1), 10);
+        s.outbox.clear();
+        s.finish(&a, GoneReason::Lost);
+        assert!(matches!(
+            s.outbox[..],
+            [
+                ServerEffect::Report(CoordinatorReport::Gone(_)),
+                ServerEffect::Presence(_)
+            ]
+        ));
     }
 
     #[test]

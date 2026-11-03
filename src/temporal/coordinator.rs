@@ -879,12 +879,10 @@ impl CoordinatorWorkflow {
 
     /// Returns true when a probe of the character's instance was requested.
     #[update]
-    pub fn server_crashed(
-        &mut self,
-        _ctx: &mut SyncWorkflowContext<Self>,
-        input: CrashedIn,
-    ) -> bool {
-        self.fleet.server_crashed(&input)
+    pub async fn server_crashed(ctx: &mut WorkflowContext<Self>, input: CrashedIn) -> bool {
+        // Before the rebuild the index is empty and every report would look unbound.
+        let _ = ctx.wait_condition(|s: &Self| s.fleet.rebuilt).await;
+        ctx.state_mut(|s| s.fleet.server_crashed(&input))
     }
 
     #[signal]
