@@ -29,7 +29,7 @@ use temporalio_sdk::{
     SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
 };
 
-use super::activities::{GameServerActivities, ProvisionerKind, StartServerIn};
+use super::activities::{GameServerActivities, ProvisionerKind, Rebuilt, StartServerIn};
 use super::now_secs;
 use super::server::GameServerWorkflow;
 use super::server::ServerInfo;
@@ -725,13 +725,15 @@ impl CoordinatorWorkflow {
                 .await;
             let found = found.unwrap_or_else(|e| {
                 tracing::warn!("coordinator: directory rebuild failed, starting empty: {e}");
-                Vec::new()
+                Rebuilt::default()
             });
             ctx.state_mut(|s| {
                 if s.fleet.code_seed == 0 {
                     s.fleet.code_seed = started;
                 }
-                s.fleet.rebuild(&found);
+                s.fleet.rebuild(&found.servers);
+                // Instance ids are unique forever: never reuse a closed instance's.
+                s.fleet.next_generation = s.fleet.next_generation.max(found.max_generation + 1);
             });
         }
         loop {
