@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions, Url, WorkflowDescribeOptions,
-    WorkflowExecutionStatus, WorkflowFetchHistoryOptions, WorkflowQueryOptions,
+    WorkflowExecutionStatus, WorkflowFetchHistoryOptions, WorkflowHistory, WorkflowQueryOptions,
     WorkflowTerminateOptions,
 };
 use temporalio_sdk::workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions};
@@ -262,33 +262,55 @@ async fn slots_up(st: &AppState, slots: &[u32]) {
     .await;
 }
 
+/// A workflow's history once no workflow task is open, so the replay never ends inside
+/// one (the SDK's eviction after such a replay trips a debug assertion).
+async fn settled_history(client: &Client, id: String) -> WorkflowHistory {
+    let start = Instant::now();
+    loop {
+        let json = client
+            .get_workflow_handle::<CoordinatorWorkflow>(id.clone())
+            .fetch_history(WorkflowFetchHistoryOptions::default())
+            .to_json()
+            .await
+            .unwrap();
+        let history: Value = serde_json::from_slice(&json).unwrap();
+        // pbjson writes `EVENT_TYPE_WORKFLOW_TASK_STARTED`; a numeric encoding is 5 / 6.
+        let last = history["events"]
+            .as_array()
+            .and_then(|e| e.last())
+            .map(|e| e["eventType"].clone())
+            .unwrap_or_default();
+        let name = last.to_string().to_lowercase().replace('_', "");
+        let open = name.contains("workflowtaskscheduled")
+            || name.contains("workflowtaskstarted")
+            || last == json!(5)
+            || last == json!(6);
+        if !open {
+            return WorkflowHistory::from_json(&json).unwrap();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{id}: a workflow task stayed open"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Replays the coordinator's, the instances' and the sessions' histories against the
 /// current code.
 async fn replays_cleanly(st: &AppState, instances: &[(u32, u64)], sids: &[&str]) {
     let client = temporal::client(st).unwrap();
     let queue = &st.config.temporal_task_queue;
-    let mut histories = vec![
-        client
-            .get_workflow_handle::<CoordinatorWorkflow>(temporal::coordinator_id(queue))
-            .fetch_history(WorkflowFetchHistoryOptions::default()),
-    ];
-    for (slot, generation) in instances {
-        histories.push(
-            client
-                .get_workflow_handle::<GameServerWorkflow>(temporal::server_id(
-                    queue,
-                    *slot,
-                    *generation,
-                ))
-                .fetch_history(WorkflowFetchHistoryOptions::default()),
-        );
-    }
-    for sid in sids {
-        histories.push(
-            client
-                .get_workflow_handle::<PlayerSessionWorkflow>(temporal::session_id(queue, sid))
-                .fetch_history(WorkflowFetchHistoryOptions::default()),
-        );
+    let mut ids = vec![temporal::coordinator_id(queue)];
+    ids.extend(
+        instances
+            .iter()
+            .map(|(slot, generation)| temporal::server_id(queue, *slot, *generation)),
+    );
+    ids.extend(sids.iter().map(|sid| temporal::session_id(queue, sid)));
+    let mut histories = Vec::new();
+    for id in ids {
+        histories.push(settled_history(&client, id).await);
     }
     let replayer = WorkflowReplayer::new(
         WorkflowReplayerOptions::new()
