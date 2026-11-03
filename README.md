@@ -65,9 +65,13 @@ unset.
 | `TEMPORAL_NAMESPACE` | `rots` | Temporal namespace. |
 | `TEMPORAL_TASK_QUEUE` | `rots-dev` | This environment's task queue, also part of its workflow IDs. |
 | `GAME_SERVER_SLOTS` | `1` | Game servers are slots `0..GAME_SERVER_SLOTS`. Reports for other slots get 400 `bad_slot`. |
+| `GAME_SERVER_PROVISIONER` | `static` | `static`: external game servers report in and players are placed on the least-loaded one (prod, local dev). `kubernetes`: every new player gets a new instance, a StatefulSet created through the Kubernetes API (needs the `rots-authserver` service account). `fake`: spawns are only recorded (tests). |
+| `GAME_SERVER_CAPACITY_PER_SERVER` | `32` | Static mode: players in game plus reserved per server before it counts as full. |
+| `GAME_SERVER_READY_TIMEOUT_SECS` | `120` | A spawned instance with no heartbeat by then is deleted. |
+| `GAME_SERVER_UNSCHEDULABLE_SECS` | `30` | A spawned instance whose pod cannot be scheduled for this long is deleted, and `/play` answers `servers_full` for 30 s. |
 | `GAME_UDP_HOST` | host of `PUBLIC_URL` | Host in `/play`'s `server.udp`. |
 | `GAME_UDP_PORT_BASE` | `25555` | Slot N's UDP port is this + N. |
-| `COORDINATOR_STALE_SECS` | `30` | A game server with no report for this long is treated as dead. |
+| `COORDINATOR_STALE_SECS` | `30` | A game server's lease: one heartbeat renews it for this long. With no heartbeat for twice this long the server counts as gone (a managed instance is deleted). |
 | `RUST_LOG` | `info` | tracing filter. |
 
 When each provider is enabled:
@@ -96,7 +100,7 @@ first, then from `Authorization: Bearer <token>`.
 | `GET /api/v1/ticket/public-key` | — | `{"alg":"EdDSA","x":"<base64url ed25519 public key>"}` | — |
 | `POST /api/v1/guest` | `{"client":"web"\|"native"}` | `{"character_id","claim_code","session_token"?}`. Creates a new guest character `Guest-<id>`. | 400 `bad_client` |
 | `GET /api/v1/me` | session | `{"kind":"guest"\|"account","character_id","character_name","account_id"?,"display_name"?,"claim_code"?}` | 401 `no_session` |
-| `POST /api/v1/play` | session | `{"ticket","expires_at","character_id","kind","server":{"slot","udp","ws_path"}}`. The ticket is valid only on that slot. | 401 `no_session`, 409 `play_in_progress`, 503 `no_game_server`, 503 `temporal_unavailable`, 500 `internal` |
+| `POST /api/v1/play` | session | `{"ticket","expires_at","character_id","kind","server":{"slot","udp","ws_path","join_code","paused"}}`. The ticket is valid only on that slot. `join_code` is the instance's code (managed instances) or `null`. | 401 `no_session`, 409 `play_in_progress`, 503 `server_starting`, 503 `server_recovering`, 503 `servers_full`, 503 `no_game_server`, 503 `temporal_unavailable`, 500 `internal` |
 | `POST /api/v1/steam/ticket` | `{"steam_ticket_hex","client"}`, plus an optional guest session | `{"session_token"?,"character_id"}`. The ticket identity must be `rots-auth`. | 503 `provider_unavailable`, 401 `steam_ticket_rejected`, 400 `bad_request` |
 | `GET /api/v1/{steam,discord,au2143}/login?return_to=/path` | optional cookie session | 302 to the provider | 404 `provider_disabled`, 400 `bad_return_to` |
 | `GET /api/v1/steam/callback` | OpenID params, `state` | 302 to `{PUBLIC_URL}{return_to}`, sets the cookie | 302 to `{PUBLIC_URL}/?login_error=<code>` |
@@ -107,10 +111,18 @@ first, then from `Authorization: Bearer <token>`.
 The `login_error` codes are `invalid_state` (the state is unknown, already used, or older
 than 10 minutes), `provider_error` and `internal`.
 
-`/play` runs the `play` update on the session's workflow, starting it on the first call.
-The coordinator picks the slot the character is already on, else the session's own slot
-(its unexpired assignment, or a slot it is playing on), else the least-loaded healthy slot
-(players plus reservations, ties to the lowest slot), and reserves it for 360 s. It answers
+`/play` runs the `play` update on the session's workflow, starting it on the first call,
+which asks the coordinator's `place` update where the character plays. First match wins:
+- the instance the character is on (`server_starting` while it starts, `server_recovering` while it restarts);
+- the instance reserved for it by an earlier `/play`;
+- managed mode: a new instance on the lowest free slot (`server_starting`; ask again every
+  2 s), unless the cluster was full in the last 30 s (`servers_full`; ask again every 5 s)
+  or three spawns in a row failed (`no_game_server` for 300 s);
+- static mode: the least-loaded ready server (players plus reservations, ties to the
+  lowest slot, at most `GAME_SERVER_CAPACITY_PER_SERVER`);
+- otherwise `no_game_server`.
+
+A pick is reserved for 360 s (plus the ready timeout while the instance starts). It answers
 within 10 s. A play that arrives while another play of the same session is running waits
 for it and gets the same slot; two plays that reach the workflow together (for example,
 both starting it) get one `409 play_in_progress`.
@@ -137,19 +149,25 @@ reject a ticket whose `srv` differs.
 ## Internal API
 
 Game servers report through `INTERNAL_PORT`, never through the gateway, with
-`Authorization: Bearer $COORDINATOR_TOKEN`. Each report becomes an update (join) or a
-signal (heartbeat, leave) on the coordinator workflow, within 4 s. Every 503 is logged as an
-error: game servers refuse new players while they cannot get a join answered.
+`Authorization: Bearer $COORDINATOR_TOKEN`. Each report becomes a signal (heartbeat, leave)
+or an update (join, shutdown-request) on the instance's workflow
+`rots-gs-{TEMPORAL_TASK_QUEUE}-{slot}-g{generation}`, within 4 s. In static mode a report
+starts that workflow if it is not running; a managed instance's report never does, and gets
+409 `unknown_instance` instead, which tells the server to write its shutdown sentinel and
+exit. Every 503 is logged as an error: game servers refuse new players while they cannot get
+a join answered.
 
 | Method + path | Body | Success | Failure |
 |---|---|---|---|
-| `POST /internal/v1/servers/heartbeat` | `{"slot","boot_id","players":[{"character_id","sid"}]}`, every 10 s | 204 | 503 `temporal_unavailable` |
-| `POST /internal/v1/servers/join` | `{"slot","boot_id","character_id","sid"}`, before admitting a player | 200 `{"result":"admitted"}` | 409 `session_ended`, 409 `already_on_other_server`, 503 `db_unavailable`, 503 `temporal_unavailable` |
-| `POST /internal/v1/servers/leave` | `{"slot","boot_id","character_id"}` | 204 | 503 `temporal_unavailable` |
+| `POST /internal/v1/servers/heartbeat` | `{"slot","generation","boot_id","players":[{"character_id","sid"}],"connected","paused","udp_port"}`, every 10 s | 204 | 409 `unknown_instance`, 503 `temporal_unavailable` |
+| `POST /internal/v1/servers/join` | `{"slot","generation","boot_id","character_id","sid"}`, before admitting a player | 200 `{"result":"admitted"}` | 409 `session_ended`, 409 `already_on_other_server`, 409 `server_draining`, 409 `unknown_instance`, 503 `db_unavailable`, 503 `temporal_unavailable` |
+| `POST /internal/v1/servers/leave` | `{"slot","generation","boot_id","character_id"}` | 204 | 409 `unknown_instance` (managed only), 503 `temporal_unavailable` |
+| `POST /internal/v1/servers/shutdown-request` | `{"slot","generation","boot_id","reason":"idle"\|"sigterm","players":[character_id]}`, when the server decides to shut down | 200 `{"plan":"destroy"}` (exit) or `{"plan":"to_menu"}` (send every client to the menu, then exit) | 409 `unknown_instance`, 503 `temporal_unavailable` |
 
 Every route also answers 401 `bad_coordinator_token`, 400 `bad_slot` (slot not below
 `GAME_SERVER_SLOTS`) and 400 `bad_request` (malformed JSON).
-- `boot_id` is random per game-server process. A new one for a slot clears its players.
+- `generation` identifies the instance on its slot; servers that omit it are generation 1. `connected` (default: the roster size), `paused` and `udp_port` are optional; `udp_port` becomes `/play`'s `server.udp` port.
+- `boot_id` is random per game-server process. A new one for an instance clears its players.
 - `players` is the full roster, pending joins included. For a known `boot_id` it only removes players; the first heartbeat from an unknown slot adopts it, which is how a coordinator that lost its state recovers.
 - A join is refused with `session_ended` when the ticket's session (`sid`) no longer exists: logged out, replaced by a new login, removed by a claim, or expired. Players already in game are not re-checked.
 - A game server must send its reports in order, one at a time: dropping players missing from a roster is only correct because a join always arrives before the heartbeat that lists it.
@@ -161,13 +179,28 @@ is unreachable; `/ready` answers 503 until it is connected. Each environment has
 
 | Workflow | ID | Started by | State |
 |---|---|---|---|
-| Coordinator | `rots-coordinator-{TEMPORAL_TASK_QUEUE}` | the first report or `/play` | per slot: `boot_id`, last report, players; reservations |
+| Coordinator | `rots-coordinator-{TEMPORAL_TASK_QUEUE}` | the first `/play` or instance report | directory (slot → generation, phase, join code, UDP port), character index (character → instance), reservations, spawn back-off |
+| Game server | `rots-gs-{TEMPORAL_TASK_QUEUE}-{slot}-g{generation}` | the coordinator's spawn (managed), or the server's first report (static) | lease, roster, phase (`provisioning` / `ready` / `draining`) |
 | Session | `rots-session-{TEMPORAL_TASK_QUEUE}-{sid}` | the session's first `/play` | assigned slot, presence, `in_menus` / `assigned` / `in_game` / `ended` |
 
-The coordinator continues as new every hour or 2000 events and has a 3 h run timeout. A
-session ends at logout, or 24 h after it started once none of its characters is in game, and
-at the latest after 48 h. The task queue is part of both IDs because all previews share the
-`rots-preview` namespace.
+Heartbeats only reach the game-server workflow, which reports `server_ready`,
+`server_status` (on change, and every 300 s), `release` and `server_gone` to the coordinator,
+and presence to sessions. A coordinator started without state (first start, or after it was
+terminated) rebuilds its directory from the running game-server workflows before it places
+anyone. The coordinator continues as new every hour or 2000 events (checked on every wake)
+and has a 3 h run timeout; a game-server workflow continues as new hourly and has a 24 h run
+timeout. A session ends at logout, or 24 h after it started once none of its characters is in
+game, and at the latest after 48 h. The task queue is part of every ID because all previews
+share the `rots-preview` namespace.
+
+Workflow code changes that are not replay-compatible (this release's coordinator and session)
+need the running coordinator and sessions terminated after the rollout; the next `/play` and
+report recreate them:
+
+```
+temporal workflow terminate --namespace <ns> -w rots-coordinator-<queue> --reason <why>
+temporal workflow terminate --namespace <ns> --query "WorkflowType='PlayerSessionWorkflow' AND TaskQueue='<queue>' AND ExecutionStatus='Running'" --reason <why>
+```
 
 Workflow code must be deterministic: time only from `ctx.workflow_time()`,
 `BTreeMap`/`BTreeSet` in workflow state, no I/O and no randomness. Wrap any change to the

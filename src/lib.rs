@@ -5,6 +5,7 @@ use sqlx::PgPool;
 
 pub mod api;
 pub mod internal;
+pub mod k8s;
 pub mod providers;
 pub mod sessions;
 pub mod temporal;
@@ -69,6 +70,21 @@ pub struct Config {
     /// Slots are 0..GAME_SERVER_SLOTS; reports for other slots are rejected.
     #[clap(long, default_value = "1", env)]
     pub game_server_slots: u32,
+    /// `static`: external servers report in and are placed least-loaded (prod, local
+    /// dev). `kubernetes`: the coordinator spawns one instance per new player.
+    /// `fake`: spawns are only recorded (tests).
+    #[clap(long, value_enum, default_value = "static", env)]
+    pub game_server_provisioner: temporal::activities::ProvisionerKind,
+    /// Static mode: players (in game plus reserved) per server before it is full.
+    #[clap(long, default_value = "32", env)]
+    pub game_server_capacity_per_server: u32,
+    /// A spawned instance with no heartbeat for this long is deleted.
+    #[clap(long, default_value = "120", env)]
+    pub game_server_ready_timeout_secs: u64,
+    /// A spawned instance whose pod cannot be scheduled for this long means the
+    /// cluster is full: it is deleted and players get `servers_full`.
+    #[clap(long, default_value = "30", env)]
+    pub game_server_unschedulable_secs: u64,
     /// Host in `/play`'s `server.udp`; unset = the host of `PUBLIC_URL`.
     #[clap(long, env)]
     pub game_udp_host: Option<String>,
@@ -176,5 +192,6 @@ pub async fn build_state(config: Config, db: PgPool) -> anyhow::Result<api::AppS
         providers: Arc::new(providers),
         http,
         temporal: Default::default(),
+        fake_calls: Default::default(),
     })
 }

@@ -1,5 +1,6 @@
-//! Temporal: the fleet [`coordinator`] and per-login [`session`] workflows, their
-//! worker (hosted in this process) and the client calls the HTTP handlers make.
+//! Temporal: the fleet [`coordinator`], the per-instance [`server`] and the per-login
+//! [`session`] workflows, their worker (hosted in this process) and the client calls the
+//! HTTP handlers make.
 //!
 //! Workflow code must be deterministic: time only from `ctx.workflow_time()`;
 //! `BTreeMap`/`BTreeSet` only in workflow state (never `HashMap`/`HashSet`); no I/O;
@@ -9,6 +10,7 @@
 //! poll the same task queue and replay each other's histories.
 pub mod activities;
 pub mod coordinator;
+pub mod server;
 pub mod session;
 
 use std::sync::{Arc, RwLock};
@@ -17,9 +19,10 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context;
 use http::StatusCode;
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, Url, WorkflowIdConflictPolicy,
-    WorkflowIdReusePolicy, WorkflowSignalOptions, WorkflowStartOptions,
+    Client, ClientOptions, Connection, ConnectionOptions, Url, WorkflowExecuteUpdateOptions,
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowSignalOptions, WorkflowStartOptions,
     WorkflowUpdateWithStartOptions,
+    errors::{WorkflowInteractionError, WorkflowUpdateError},
 };
 use temporalio_common::{HasWorkflowDefinition, SignalDefinition, UpdateDefinition};
 use temporalio_sdk::{Runtime, Worker, WorkerOptions};
@@ -27,8 +30,9 @@ use tokio::sync::watch;
 
 use crate::api::{ApiError, AppState};
 use crate::sessions::SessionRow;
-use activities::SessionActivities;
+use activities::{GameServerActivities, ProvisionerKind, SessionActivities};
 use coordinator::{CoordinatorArgs, CoordinatorWorkflow};
+use server::{GameServerArgs, GameServerWorkflow};
 use session::{PlayIn, PlayOutcome, PlayerSessionWorkflow, SessionArgs};
 
 /// The connected client, `None` while Temporal is unreachable or unconfigured.
@@ -36,6 +40,7 @@ pub type TemporalSlot = Arc<RwLock<Option<Client>>>;
 
 /// The type the `#[workflow_methods]` macro ties the coordinator's signals and updates to.
 type CoordinatorRun = <CoordinatorWorkflow as HasWorkflowDefinition>::Run;
+type ServerRun = <GameServerWorkflow as HasWorkflowDefinition>::Run;
 
 /// Upper bound for `/play` (the session's assign + mint fit in 7 s).
 const PLAY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,11 +79,171 @@ pub fn session_id(queue: &str, sid: &str) -> String {
     format!("rots-session-{queue}-{sid}")
 }
 
+/// One per game-server instance; the generation keeps a reused slot's ids apart.
+pub fn server_id(queue: &str, slot: u32, generation: u64) -> String {
+    format!("rots-gs-{queue}-{slot}-g{generation}")
+}
+
 fn coordinator_args(st: &AppState) -> CoordinatorArgs {
+    let c = &st.config;
     CoordinatorArgs {
-        task_queue: st.config.temporal_task_queue.clone(),
-        stale_secs: st.config.coordinator_stale_secs,
+        task_queue: c.temporal_task_queue.clone(),
+        provisioner: c.game_server_provisioner,
+        slots: c.game_server_slots,
+        capacity_per_server: c.game_server_capacity_per_server,
+        ready_timeout_secs: c.game_server_ready_timeout_secs,
         carried: None,
+    }
+}
+
+pub fn server_args(
+    st: &AppState,
+    slot: u32,
+    generation: u64,
+    join_code: Option<String>,
+) -> GameServerArgs {
+    let c = &st.config;
+    GameServerArgs {
+        task_queue: c.temporal_task_queue.clone(),
+        slot,
+        generation,
+        provisioner: c.game_server_provisioner,
+        join_code,
+        stale_secs: c.coordinator_stale_secs,
+        ready_timeout_secs: c.game_server_ready_timeout_secs,
+        unschedulable_secs: c.game_server_unschedulable_secs,
+        carried: None,
+    }
+}
+
+/// A report to an instance's workflow could not be delivered.
+#[derive(Debug)]
+pub enum ServerCallError {
+    /// No running workflow for that (slot, generation): the instance is gone.
+    NotFound,
+    Other(anyhow::Error),
+}
+
+/// Static servers start their own workflow (they are not spawned by the coordinator),
+/// so their reports start it if needed; a managed instance's report never does.
+fn static_mode(st: &AppState) -> bool {
+    st.config.game_server_provisioner == ProvisionerKind::Static
+}
+
+/// Signals an instance's workflow; for a static server, starting it if needed.
+pub async fn server_signal<S>(
+    st: &AppState,
+    slot: u32,
+    generation: u64,
+    signal: S,
+    input: S::Input,
+) -> Result<(), ServerCallError>
+where
+    S: SignalDefinition<Workflow = ServerRun>,
+    S::Input: Send,
+{
+    let client =
+        client(st).map_err(|_| ServerCallError::Other(anyhow::anyhow!("temporal unavailable")))?;
+    let queue = &st.config.temporal_task_queue;
+    let id = server_id(queue, slot, generation);
+    if static_mode(st) {
+        let options = WorkflowStartOptions::new(queue.clone(), id)
+            .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
+            .id_reuse_policy(WorkflowIdReusePolicy::AllowDuplicate)
+            .run_timeout(server::RUN_TIMEOUT)
+            .build();
+        client
+            .signal_with_start_workflow(
+                GameServerWorkflow::run,
+                server_args(st, slot, generation, None),
+                signal,
+                input,
+                options,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| ServerCallError::Other(anyhow::Error::from(e).context("instance signal")))
+    } else {
+        server_signal_existing(st, slot, generation, signal, input).await
+    }
+}
+
+/// Signals an existing instance workflow only; `NotFound` if it is not running.
+pub async fn server_signal_existing<S>(
+    st: &AppState,
+    slot: u32,
+    generation: u64,
+    signal: S,
+    input: S::Input,
+) -> Result<(), ServerCallError>
+where
+    S: SignalDefinition<Workflow = ServerRun>,
+    S::Input: Send,
+{
+    let client =
+        client(st).map_err(|_| ServerCallError::Other(anyhow::anyhow!("temporal unavailable")))?;
+    let id = server_id(&st.config.temporal_task_queue, slot, generation);
+    match client
+        .get_workflow_handle::<GameServerWorkflow>(id)
+        .signal(signal, input, WorkflowSignalOptions::default())
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(WorkflowInteractionError::NotFound(_)) => Err(ServerCallError::NotFound),
+        Err(e) => Err(ServerCallError::Other(
+            anyhow::Error::from(e).context("instance signal"),
+        )),
+    }
+}
+
+/// Runs an update on an instance's workflow; for a static server, starting it if needed.
+pub async fn server_update<U>(
+    st: &AppState,
+    slot: u32,
+    generation: u64,
+    update: U,
+    input: U::Input,
+) -> Result<U::Output, ServerCallError>
+where
+    U: UpdateDefinition<Workflow = ServerRun>,
+    U::Input: Send,
+    U::Output: 'static,
+{
+    let client =
+        client(st).map_err(|_| ServerCallError::Other(anyhow::anyhow!("temporal unavailable")))?;
+    let queue = &st.config.temporal_task_queue;
+    let id = server_id(queue, slot, generation);
+    if static_mode(st) {
+        let options = WorkflowUpdateWithStartOptions::new(
+            queue.clone(),
+            id,
+            WorkflowIdConflictPolicy::UseExisting,
+        )
+        .id_reuse_policy(WorkflowIdReusePolicy::AllowDuplicate)
+        .run_timeout(server::RUN_TIMEOUT)
+        .build();
+        client
+            .execute_update_with_start_workflow(
+                GameServerWorkflow::run,
+                server_args(st, slot, generation, None),
+                update,
+                input,
+                options,
+            )
+            .await
+            .map_err(|e| ServerCallError::Other(anyhow::Error::from(e).context("instance update")))
+    } else {
+        match client
+            .get_workflow_handle::<GameServerWorkflow>(id)
+            .execute_update(update, input, WorkflowExecuteUpdateOptions::default())
+            .await
+        {
+            Ok(out) => Ok(out),
+            Err(WorkflowUpdateError::NotFound(_)) => Err(ServerCallError::NotFound),
+            Err(e) => Err(ServerCallError::Other(
+                anyhow::Error::from(e).context("instance update"),
+            )),
+        }
     }
 }
 
@@ -273,11 +438,28 @@ async fn run_worker(
         ClientOptions::new(config.temporal_namespace.clone()).build(),
     )
     .context("client")?;
+    let kube = match config.game_server_provisioner {
+        ProvisionerKind::Kubernetes => match crate::k8s::Kube::in_cluster() {
+            Ok(kube) => Some(kube),
+            Err(e) => {
+                tracing::error!(
+                    "GAME_SERVER_PROVISIONER=kubernetes but {e:#}: no instance can start"
+                );
+                None
+            }
+        },
+        ProvisionerKind::Static | ProvisionerKind::Fake => None,
+    };
     let options = WorkerOptions::new(config.temporal_task_queue.clone())
         .register_workflow::<CoordinatorWorkflow>()?
+        .register_workflow::<GameServerWorkflow>()?
         .register_workflow::<PlayerSessionWorkflow>()?
         .register_activities(SessionActivities {
             state: state.clone(),
+        })
+        .register_activities(GameServerActivities {
+            state: state.clone(),
+            kube,
         })
         .build();
     let mut worker = Worker::new(runtime, client.clone(), options).context("worker")?;
