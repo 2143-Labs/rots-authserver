@@ -31,6 +31,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Temporal client, published by the worker thread once connected.
     pub temporal: TemporalSlot,
+    /// What the fake provisioner (`GAME_SERVER_PROVISIONER=fake`) was asked to do.
+    pub fake_calls: Arc<std::sync::Mutex<Vec<temporal::activities::FakeCall>>>,
 }
 
 /// The gateway strips `/auth`, so these are served at the root.
@@ -84,6 +86,10 @@ pub struct ApiError {
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str) -> Self {
         Self { status, code }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
     }
 
     pub fn internal(err: anyhow::Error) -> Self {
@@ -247,10 +253,15 @@ struct AssignedServer {
     udp: String,
     /// Same-origin WebSocket path for web clients.
     ws_path: String,
+    /// The instance's join code (tutorial instances only).
+    join_code: Option<String>,
+    /// The world is paused (restoring after a restart, or paused by a player).
+    paused: bool,
 }
 
 /// A ticket for the session's current character, bound to the game-server slot the
-/// coordinator picked.
+/// coordinator picked. While that instance is starting (or restarting) the answer is
+/// 503 `server_starting` (`server_recovering`) and the client asks again.
 async fn play(
     State(st): State<AppState>,
     Session(session): Session,
@@ -261,9 +272,15 @@ async fn play(
             ticket,
             expires_at,
             slot,
+            generation: _,
+            udp_port,
+            join_code,
+            paused,
         } => {
             let host = st.config.game_udp_host.as_deref().unwrap_or("localhost");
-            let port = u32::from(st.config.game_udp_port_base) + slot;
+            let port = udp_port
+                .map(u32::from)
+                .unwrap_or(u32::from(st.config.game_udp_port_base) + slot);
             Ok(Json(PlayResponse {
                 ticket,
                 expires_at,
@@ -273,12 +290,26 @@ async fn play(
                     slot,
                     udp: format!("{host}:{port}"),
                     ws_path: format!("/ws/{slot}"),
+                    join_code,
+                    paused,
                 },
             }))
         }
+        PlayOutcome::Starting => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_starting",
+        )),
+        PlayOutcome::Recovering => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_recovering",
+        )),
         PlayOutcome::NoGameServer => Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_game_server",
+        )),
+        PlayOutcome::ServersFull => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "servers_full",
         )),
         PlayOutcome::Busy => Err(ApiError::new(StatusCode::CONFLICT, "play_in_progress")),
         PlayOutcome::Ended => Err(ApiError::no_session()),

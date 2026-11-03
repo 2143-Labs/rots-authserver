@@ -513,8 +513,7 @@ mod tests {
     async fn steam_ticket_response_yields_steamid_or_the_steam_error() {
         let ok = serde_json::json!({"response":{"params":{"result":"OK","steamid":"76561198027378405"}}});
         assert_eq!(ticket_steam_id(&ok).unwrap(), 76561198027378405);
-        let rejected =
-            serde_json::json!({"response":{"error":{"errorcode":101,"errordesc":"Invalid ticket"}}});
+        let rejected = serde_json::json!({"response":{"error":{"errorcode":101,"errordesc":"Invalid ticket"}}});
         let err = ticket_steam_id(&rejected).unwrap_err().to_string();
         assert!(
             err.contains("101") && err.contains("Invalid ticket"),

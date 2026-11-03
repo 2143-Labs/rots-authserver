@@ -1,8 +1,11 @@
 //! Internal API for game servers, served on `INTERNAL_PORT` only (never through the
 //! gateway). Every route needs `Authorization: Bearer $COORDINATOR_TOKEN` and turns
-//! the report into an update (join) or signal (heartbeat, leave) on the coordinator
-//! workflow. Game servers refuse a join they cannot get an answer for, so every 503
-//! here is a critical game-server event and logs `error!`.
+//! the report into a signal (heartbeat, leave) or update (join, shutdown-request) on
+//! the instance's workflow, `rots-gs-<queue>-<slot>-g<generation>`. Static servers
+//! (`GAME_SERVER_PROVISIONER=static`) start that workflow with their reports; a report
+//! for a managed instance whose workflow is not running gets 409 `unknown_instance`,
+//! which tells the server to exit. Game servers refuse a join they cannot get an answer
+//! for, so every 503 here is a critical game-server event and logs `error!`.
 use std::{future::Future, time::Duration};
 
 use axum::{
@@ -22,8 +25,10 @@ use crate::{
     api::{ApiError, AppState},
     sessions,
     temporal::{
-        self,
-        coordinator::{CoordinatorWorkflow, HeartbeatIn, JoinIn, JoinOutcome, LeaveIn},
+        self, ServerCallError,
+        activities::ProvisionerKind,
+        coordinator::{JoinOutcome, ShutdownPlan},
+        server::{GameServerWorkflow, HeartbeatIn, JoinIn, LeaveIn, ShutdownRequestIn},
     },
 };
 
@@ -35,6 +40,10 @@ pub fn router(state: AppState) -> Router {
         .route("/internal/v1/servers/heartbeat", post(heartbeat))
         .route("/internal/v1/servers/join", post(join))
         .route("/internal/v1/servers/leave", post(leave))
+        .route(
+            "/internal/v1/servers/shutdown-request",
+            post(shutdown_request),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -64,14 +73,19 @@ fn check_slot(st: &AppState, slot: u32) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn unknown_instance() -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, "unknown_instance")
+}
+
 async fn report<T>(
     path: &'static str,
-    call: impl Future<Output = anyhow::Result<T>>,
+    call: impl Future<Output = Result<T, ServerCallError>>,
 ) -> Result<T, ApiError> {
     let unavailable = ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "temporal_unavailable");
     match tokio::time::timeout(REPORT_TIMEOUT, call).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(e)) => {
+        Ok(Err(ServerCallError::NotFound)) => Err(unknown_instance()),
+        Ok(Err(ServerCallError::Other(e))) => {
             tracing::error!(path, "game-server report failed: {e:#}");
             Err(unavailable)
         }
@@ -88,9 +102,10 @@ async fn report<T>(
 async fn heartbeat(State(st): State<AppState>, body: Bytes) -> Result<StatusCode, ApiError> {
     let input: HeartbeatIn = parse(&body)?;
     check_slot(&st, input.slot)?;
+    let (slot, generation) = (input.slot, input.generation);
     report(
         "heartbeat",
-        temporal::coordinator_signal(&st, CoordinatorWorkflow::heartbeat, input),
+        temporal::server_signal(&st, slot, generation, GameServerWorkflow::heartbeat, input),
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -110,9 +125,10 @@ async fn join(State(st): State<AppState>, body: Bytes) -> Result<Json<Value>, Ap
             ));
         }
     }
+    let (slot, generation) = (input.slot, input.generation);
     match report(
         "join",
-        temporal::coordinator_update(&st, CoordinatorWorkflow::join, input),
+        temporal::server_update(&st, slot, generation, GameServerWorkflow::join, input),
     )
     .await?
     {
@@ -121,18 +137,55 @@ async fn join(State(st): State<AppState>, body: Bytes) -> Result<Json<Value>, Ap
             StatusCode::CONFLICT,
             "already_on_other_server",
         )),
+        JoinOutcome::ServerDraining => Err(ApiError::new(StatusCode::CONFLICT, "server_draining")),
+        JoinOutcome::UnknownInstance => Err(unknown_instance()),
+        JoinOutcome::Failed { reason } => {
+            tracing::error!(path = "join", "game-server report failed: {reason}");
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporal_unavailable",
+            ))
+        }
     }
 }
 
 async fn leave(State(st): State<AppState>, body: Bytes) -> Result<StatusCode, ApiError> {
     let input: LeaveIn = parse(&body)?;
     check_slot(&st, input.slot)?;
-    report(
+    let (slot, generation) = (input.slot, input.generation);
+    let sent = report(
         "leave",
-        temporal::coordinator_signal(&st, CoordinatorWorkflow::leave, input),
+        temporal::server_signal_existing(&st, slot, generation, GameServerWorkflow::leave, input),
+    )
+    .await;
+    match sent {
+        // A static server's workflow ends when it goes silent, taking its players with it.
+        Err(e)
+            if e.code() == "unknown_instance"
+                && st.config.game_server_provisioner == ProvisionerKind::Static =>
+        {
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(e) => Err(e),
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+    }
+}
+
+/// The server decided to shut down (idle, or SIGTERM); the answer says what to do with
+/// its players.
+async fn shutdown_request(
+    State(st): State<AppState>,
+    body: Bytes,
+) -> Result<Json<ShutdownPlan>, ApiError> {
+    let input: ShutdownRequestIn = parse(&body)?;
+    check_slot(&st, input.slot)?;
+    let (slot, generation) = (input.slot, input.generation);
+    let plan = report(
+        "shutdown-request",
+        temporal::server_update(&st, slot, generation, GameServerWorkflow::shutdown, input),
     )
     .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(plan))
 }
 
 #[cfg(test)]
@@ -165,6 +218,7 @@ mod tests {
             providers: Arc::new(providers),
             http,
             temporal: Default::default(),
+            fake_calls: Default::default(),
         }
     }
 

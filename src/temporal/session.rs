@@ -1,7 +1,7 @@
 //! One workflow per login session (`rots-session-<queue>-<sid>`), started by the
 //! session's first `/play`. It serializes Play for the session, remembers the slot it
-//! was last given, and tracks which (slot, character) pairs the coordinator reports as
-//! connected, so `status` answers "in menus / assigned / in game".
+//! was last given, and tracks which (slot, character) pairs the game-server workflows
+//! report as joined, so `status` answers "in menus / assigned / in game".
 //!
 //! It stores no character: each `play` carries the session row's current character,
 //! so switching characters (card ROTS #31) needs nothing here.
@@ -16,8 +16,7 @@ use temporalio_sdk::{
 };
 
 use super::activities::{MintArgs, SessionActivities};
-use super::coordinator::AssignIn;
-use super::now_secs;
+use super::coordinator::{PlaceIn, Placement};
 
 /// A session with nobody in game ends after this long; the next `/play` starts a new run.
 pub const IDLE_SECS: u64 = 24 * 3600;
@@ -59,8 +58,17 @@ pub enum PlayOutcome {
         ticket: String,
         expires_at: u64,
         slot: u32,
+        generation: u64,
+        udp_port: Option<u16>,
+        join_code: Option<String>,
+        paused: bool,
     },
+    /// The character's instance is being spawned: ask again shortly.
+    Starting,
+    /// The character's instance is restarting after a crash: ask again shortly.
+    Recovering,
     NoGameServer,
+    ServersFull,
     Busy,
     Ended,
     Failed {
@@ -101,14 +109,6 @@ impl SessionState {
             self.present.remove(&pair);
         }
     }
-
-    /// Unexpired assignment, else the lowest slot this session is playing on.
-    pub fn preferred(&self, now: u64) -> Option<u32> {
-        self.assigned
-            .filter(|&(_, expires_at)| expires_at > now)
-            .map(|(slot, _)| slot)
-            .or_else(|| self.present.first().map(|&(slot, _)| slot))
-    }
 }
 
 #[workflow]
@@ -142,7 +142,6 @@ impl PlayerSessionWorkflow {
 
     #[update]
     pub async fn play(ctx: &mut WorkflowContext<Self>, input: PlayIn) -> PlayOutcome {
-        let now = now_secs(ctx.workflow_time());
         let gate = ctx.state_mut(|s| {
             if s.state.ended {
                 Err(PlayOutcome::Ended)
@@ -150,14 +149,14 @@ impl PlayerSessionWorkflow {
                 Err(PlayOutcome::Busy)
             } else {
                 s.state.playing = true;
-                Ok((s.args.sid.clone(), s.state.preferred(now)))
+                Ok(s.args.sid.clone())
             }
         });
-        let (sid, preferred) = match gate {
+        let sid = match gate {
             Ok(v) => v,
             Err(outcome) => return outcome,
         };
-        let outcome = place_and_mint(ctx, sid, preferred, input).await;
+        let outcome = place_and_mint(ctx, sid, input).await;
         ctx.state_mut(|s| {
             s.state.playing = false;
             if let PlayOutcome::Assigned {
@@ -186,21 +185,20 @@ impl PlayerSessionWorkflow {
     }
 }
 
-/// Assign (≤3 s) then mint (≤4 s): together inside the 10 s `/play` HTTP budget.
+/// Place (≤3 s) then mint (≤4 s): together inside the 10 s `/play` HTTP budget.
 async fn place_and_mint(
     ctx: &WorkflowContext<PlayerSessionWorkflow>,
     sid: String,
-    preferred: Option<u32>,
     input: PlayIn,
 ) -> PlayOutcome {
     let two_attempts = || RetryPolicy::builder().maximum_attempts(2).build();
-    let assigned = ctx
+    let placed = ctx
         .execute_local_activity(
-            SessionActivities::assign_server,
-            AssignIn {
+            SessionActivities::place_character,
+            PlaceIn {
                 character_id: input.character_id,
                 sid: sid.clone(),
-                preferred,
+                location: None,
             },
             LocalActivityOptions::builder()
                 .schedule_to_close_timeout(Duration::from_secs(3))
@@ -208,12 +206,21 @@ async fn place_and_mint(
                 .build(),
         )
         .await;
-    let slot = match assigned {
-        Ok(Some(slot)) => slot,
-        Ok(None) => return PlayOutcome::NoGameServer,
+    let (slot, generation, udp_port, join_code, paused) = match placed {
+        Ok(Placement::Ready {
+            slot,
+            generation,
+            udp_port,
+            join_code,
+            paused,
+        }) => (slot, generation, udp_port, join_code, paused),
+        Ok(Placement::Starting { .. }) => return PlayOutcome::Starting,
+        Ok(Placement::Recovering { .. }) => return PlayOutcome::Recovering,
+        Ok(Placement::NoGameServer) => return PlayOutcome::NoGameServer,
+        Ok(Placement::ServersFull) => return PlayOutcome::ServersFull,
         Err(e) => {
             return PlayOutcome::Failed {
-                reason: format!("assign_server: {e}"),
+                reason: format!("place_character: {e}"),
             };
         }
     };
@@ -238,6 +245,10 @@ async fn place_and_mint(
             ticket: m.ticket,
             expires_at: m.expires_at,
             slot,
+            generation,
+            udp_port,
+            join_code,
+            paused,
         },
         Err(e) => PlayOutcome::Failed {
             reason: format!("mint_ticket: {e}"),
@@ -274,16 +285,6 @@ mod tests {
         assert_eq!(s.assigned, None, "joining clears the assignment");
         s.ended = true;
         assert_eq!(s.status(), SessionStatus::Ended);
-    }
-
-    #[test]
-    fn preferred_ignores_expired_assignment() {
-        let mut s = SessionState::default();
-        s.assigned = Some((3, 100));
-        assert_eq!(s.preferred(99), Some(3));
-        assert_eq!(s.preferred(100), None);
-        s.apply_presence(&pres(1, 7, true));
-        assert_eq!(s.preferred(100), Some(1));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! End-to-end: the public and internal routers against a real Postgres (a fresh database
 //! per test, via `#[sqlx::test]`) and a real Temporal dev server, with fake game servers
-//! that report like bevy2025's (one ordered sender, heartbeat every 500 ms).
+//! that report like bevy2025's (one ordered sender, heartbeat every 500 ms). Static-mode
+//! tests stand in for today's prod; `GAME_SERVER_PROVISIONER=fake` tests stand in for the
+//! Kubernetes provisioner: they start the fake server the coordinator asked for.
 //!
 //! Run with `nix develop -c ./scripts/ci-test.sh`, which sets `DATABASE_URL` and
 //! `TEMPORAL_TEST_ADDRESS`. Each test uses its own task queue, so they run in parallel.
@@ -20,6 +22,7 @@ use sqlx::PgPool;
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions, Url, WorkflowDescribeOptions,
     WorkflowExecutionStatus, WorkflowFetchHistoryOptions, WorkflowQueryOptions,
+    WorkflowTerminateOptions,
 };
 use temporalio_sdk::workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions};
 use tokio::sync::{mpsc, oneshot};
@@ -31,7 +34,9 @@ use rots_authserver::{
     build_state, internal, sessions,
     temporal::{
         self,
-        coordinator::{CoordinatorWorkflow, FleetState},
+        activities::{FakeCall, InstanceIn, ProvisionerKind},
+        coordinator::{CoordinatorWorkflow, FleetState, Phase},
+        server::GameServerWorkflow,
         session::PlayerSessionWorkflow,
     },
 };
@@ -66,6 +71,9 @@ fn config(temporal_address: Option<String>) -> Config {
         temporal_task_queue: format!("t-{nanos}"),
         coordinator_token: TOKEN.into(),
         game_server_slots: 4,
+        game_server_capacity_per_server: 32,
+        game_server_ready_timeout_secs: 120,
+        game_server_unschedulable_secs: 30,
         game_udp_port_base: 25555,
         coordinator_stale_secs: 2,
         ..Default::default()
@@ -80,9 +88,18 @@ fn temporal_address() -> String {
 /// the worker, whose `AppState` would otherwise keep the test's pool (and the shared
 /// sqlx master-pool permits it borrowed) alive for the rest of the run.
 async fn connected(db: PgPool) -> (AppState, temporal::WorkerHandle) {
-    let st = build_state(config(Some(temporal_address())), db)
-        .await
-        .unwrap();
+    connected_with(db, ProvisionerKind::Static).await
+}
+
+async fn connected_with(
+    db: PgPool,
+    provisioner: ProvisionerKind,
+) -> (AppState, temporal::WorkerHandle) {
+    let config = Config {
+        game_server_provisioner: provisioner,
+        ..config(Some(temporal_address()))
+    };
+    let st = build_state(config, db).await.unwrap();
     let worker = temporal::start_worker(st.clone());
     eventually("worker connected", Duration::from_secs(15), || {
         let st = st.clone();
@@ -234,17 +251,20 @@ async fn slots_up(st: &AppState, slots: &[u32]) {
             let st = st.clone();
             let slots = slots.to_vec();
             async move {
-                fleet(&st)
-                    .await
-                    .is_some_and(|f| slots.iter().all(|s| f.slots.contains_key(s)))
+                fleet(&st).await.is_some_and(|f| {
+                    slots
+                        .iter()
+                        .all(|s| f.servers.get(s).is_some_and(|e| e.phase == Phase::Ready))
+                })
             }
         },
     )
     .await;
 }
 
-/// Replays the coordinator's and the sessions' histories against the current code.
-async fn replays_cleanly(st: &AppState, sids: &[&str]) {
+/// Replays the coordinator's, the instances' and the sessions' histories against the
+/// current code.
+async fn replays_cleanly(st: &AppState, instances: &[(u32, u64)], sids: &[&str]) {
     let client = temporal::client(st).unwrap();
     let queue = &st.config.temporal_task_queue;
     let mut histories = vec![
@@ -252,6 +272,17 @@ async fn replays_cleanly(st: &AppState, sids: &[&str]) {
             .get_workflow_handle::<CoordinatorWorkflow>(temporal::coordinator_id(queue))
             .fetch_history(WorkflowFetchHistoryOptions::default()),
     ];
+    for (slot, generation) in instances {
+        histories.push(
+            client
+                .get_workflow_handle::<GameServerWorkflow>(temporal::server_id(
+                    queue,
+                    *slot,
+                    *generation,
+                ))
+                .fetch_history(WorkflowFetchHistoryOptions::default()),
+        );
+    }
     for sid in sids {
         histories.push(
             client
@@ -262,6 +293,8 @@ async fn replays_cleanly(st: &AppState, sids: &[&str]) {
     let replayer = WorkflowReplayer::new(
         WorkflowReplayerOptions::new()
             .register_workflow::<CoordinatorWorkflow>()
+            .unwrap()
+            .register_workflow::<GameServerWorkflow>()
             .unwrap()
             .register_workflow::<PlayerSessionWorkflow>()
             .unwrap()
@@ -280,6 +313,10 @@ async fn replays_cleanly(st: &AppState, sids: &[&str]) {
 // ---------------------------------------------------------------- fake game server
 
 enum Op {
+    Shutdown {
+        reason: &'static str,
+        reply: oneshot::Sender<(StatusCode, Value)>,
+    },
     Join {
         character_id: i64,
         sid: String,
@@ -298,7 +335,31 @@ struct FakeServer {
 }
 
 impl FakeServer {
+    /// A static server as today's prod runs them: its reports carry no generation.
     fn start(st: &AppState, slot: u32, boot_id: &str, roster: &[(i64, &str)]) -> Self {
+        Self::spawn(st, slot, None, boot_id, roster)
+    }
+
+    /// A server of `(slot, generation)`; its heartbeats also carry `connected` and a UDP
+    /// port, as a managed instance's do.
+    fn start_instance(
+        st: &AppState,
+        slot: u32,
+        generation: u64,
+        boot_id: &str,
+        roster: &[(i64, &str)],
+    ) -> Self {
+        Self::spawn(st, slot, Some(generation), boot_id, roster)
+    }
+
+    fn spawn(
+        st: &AppState,
+        slot: u32,
+        managed: Option<u64>,
+        boot_id: &str,
+        roster: &[(i64, &str)],
+    ) -> Self {
+        let generation = managed.unwrap_or(1);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let router = internal::router(st.clone());
         let boot_id = boot_id.to_owned();
@@ -310,7 +371,10 @@ impl FakeServer {
                 tokio::select! {
                     _ = tick.tick() => {
                         let players: Vec<Value> = players.iter().map(|(c, s)| json!({"character_id": c, "sid": s})).collect();
-                        let body = json!({"slot": slot, "boot_id": boot_id, "players": players});
+                        let body = match managed {
+                            None => json!({"slot": slot, "boot_id": boot_id, "players": players}),
+                            Some(_) => json!({"slot": slot, "generation": generation, "boot_id": boot_id, "players": players, "connected": players.len(), "udp_port": 36000 + slot}),
+                        };
                         let sent = Instant::now();
                         let (status, _) = call(router.clone(), Method::POST, "/internal/v1/servers/heartbeat", Some(TOKEN), Some(body)).await;
                         if status != StatusCode::NO_CONTENT || sent.elapsed() > Duration::from_millis(500) {
@@ -320,7 +384,7 @@ impl FakeServer {
                     op = rx.recv() => match op {
                         Some(Op::Join { character_id, sid, reply }) => {
                             players.insert(character_id, sid.clone());
-                            let body = json!({"slot": slot, "boot_id": boot_id, "character_id": character_id, "sid": sid});
+                            let body = json!({"slot": slot, "generation": generation, "boot_id": boot_id, "character_id": character_id, "sid": sid});
                             let answer = call(router.clone(), Method::POST, "/internal/v1/servers/join", Some(TOKEN), Some(body)).await;
                             if answer.0 != StatusCode::OK {
                                 players.remove(&character_id);
@@ -329,8 +393,15 @@ impl FakeServer {
                         }
                         Some(Op::Leave { character_id }) => {
                             players.remove(&character_id);
-                            let body = json!({"slot": slot, "boot_id": boot_id, "character_id": character_id});
+                            let body = json!({"slot": slot, "generation": generation, "boot_id": boot_id, "character_id": character_id});
                             call(router.clone(), Method::POST, "/internal/v1/servers/leave", Some(TOKEN), Some(body)).await;
+                        }
+                        Some(Op::Shutdown { reason, reply }) => {
+                            let ids: Vec<i64> = players.keys().copied().collect();
+                            let body = json!({"slot": slot, "generation": generation, "boot_id": boot_id, "reason": reason, "players": ids});
+                            let _ = reply.send(call(router.clone(), Method::POST, "/internal/v1/servers/shutdown-request", Some(TOKEN), Some(body)).await);
+                            // A managed server exits once its shutdown is granted.
+                            break;
                         }
                         Some(Op::Stop) | None => break,
                     }
@@ -354,6 +425,13 @@ impl FakeServer {
 
     fn leave(&self, character_id: i64) {
         self.tx.send(Op::Leave { character_id }).unwrap();
+    }
+
+    /// Asks the coordinator to shut down, then stops reporting.
+    async fn shutdown(&self, reason: &'static str) -> (StatusCode, Value) {
+        let (reply, answer) = oneshot::channel();
+        self.tx.send(Op::Shutdown { reason, reply }).unwrap();
+        answer.await.unwrap()
     }
 }
 
@@ -431,7 +509,7 @@ async fn join_leave_drive_status(db: PgPool) {
     status_becomes(&st, &sid, in_game(1)).await;
     server.leave(character);
     status_becomes(&st, &sid, in_menus()).await;
-    replays_cleanly(&st, &[&sid]).await;
+    replays_cleanly(&st, &[(1, 1)], &[&sid]).await;
 }
 
 #[sqlx::test]
@@ -453,7 +531,7 @@ async fn second_server_refused(db: PgPool) {
         )
     );
     status_becomes(&st, &sid, in_game(1)).await;
-    replays_cleanly(&st, &[&sid]).await;
+    replays_cleanly(&st, &[(0, 1), (1, 1)], &[&sid]).await;
 }
 
 #[sqlx::test]
@@ -751,4 +829,340 @@ async fn ready_needs_worker(db: PgPool) {
         ready(without).await,
         (StatusCode::OK, json!({"status":"ready"}))
     );
+}
+
+// ---------------------------------------------------------------- managed instances
+
+fn fake_calls(st: &AppState) -> Vec<FakeCall> {
+    st.fake_calls.lock().unwrap().clone()
+}
+
+/// Waits until the fake provisioner has been asked for `n` instances and returns them.
+async fn provisioned(st: &AppState, n: usize) -> Vec<InstanceIn> {
+    let list = || {
+        fake_calls(st)
+            .into_iter()
+            .filter_map(|c| match c {
+                FakeCall::Provision(i) => Some(i),
+                FakeCall::Delete(_) => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    eventually(
+        &format!("{n} instances provisioned"),
+        Duration::from_secs(10),
+        || {
+            let found = list().len();
+            async move { found >= n }
+        },
+    )
+    .await;
+    list()
+}
+
+/// Plays until the answer is no longer `server_starting`.
+async fn play_until_ready(st: &AppState, token: &str) -> Value {
+    let start = Instant::now();
+    loop {
+        let (status, body) = play(st, token).await;
+        if status == StatusCode::OK {
+            return body;
+        }
+        assert_eq!(body, json!({"error":"server_starting"}), "{status}");
+        assert!(start.elapsed() < Duration::from_secs(10), "never ready");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+async fn instance_status(st: &AppState, slot: u32, generation: u64) -> WorkflowExecutionStatus {
+    temporal::client(st)
+        .unwrap()
+        .get_workflow_handle::<GameServerWorkflow>(temporal::server_id(
+            &st.config.temporal_task_queue,
+            slot,
+            generation,
+        ))
+        .describe(WorkflowDescribeOptions::default())
+        .await
+        .unwrap()
+        .status()
+}
+
+fn starting() -> (StatusCode, Value) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"error":"server_starting"}),
+    )
+}
+
+/// One spawned instance (slot 0, generation 1) with one joined player.
+async fn one_instance_one_player(st: &AppState) -> (FakeServer, String, i64, String) {
+    let token = guest(st).await;
+    assert_eq!(play(st, &token).await, starting());
+    let calls = provisioned(st, 1).await;
+    assert_eq!((calls[0].slot, calls[0].generation), (0, 1));
+    let server = FakeServer::start_instance(st, 0, 1, "a", &[]);
+    let body = play_until_ready(st, &token).await;
+    let (character, sid) = who(&body);
+    assert_eq!(
+        server.join(character, &sid).await,
+        (StatusCode::OK, json!({"result":"admitted"}))
+    );
+    status_becomes(st, &sid, in_game(0)).await;
+    (server, token, character, sid)
+}
+
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn new_player_gets_a_new_tutorial_instance(db: PgPool) {
+    let (st, _worker) = connected_with(db, ProvisionerKind::Fake).await;
+    let (a, b) = (guest(&st).await, guest(&st).await);
+    assert_eq!(play(&st, &a).await, starting());
+    assert_eq!(play(&st, &b).await, starting());
+    let calls = provisioned(&st, 2).await;
+    assert_eq!(
+        calls
+            .iter()
+            .map(|c| (c.slot, c.generation))
+            .collect::<Vec<_>>(),
+        vec![(0, 1), (1, 2)]
+    );
+    let codes: Vec<&str> = calls
+        .iter()
+        .map(|c| c.join_code.as_deref().unwrap())
+        .collect();
+    assert!(
+        codes.iter().all(|c| c.len() == 4) && codes[0] != codes[1],
+        "{codes:?}"
+    );
+    // Asking again while it starts spawns nothing new.
+    assert_eq!(play(&st, &a).await, starting());
+    assert_eq!(provisioned(&st, 2).await.len(), 2);
+
+    let s0 = FakeServer::start_instance(&st, 0, 1, "a", &[]);
+    let _s1 = FakeServer::start_instance(&st, 1, 2, "b", &[]);
+    let body = play_until_ready(&st, &a).await;
+    assert_eq!(body["server"]["slot"], 0, "{body}");
+    assert_eq!(body["server"]["udp"], "localhost:36000");
+    assert_eq!(body["server"]["ws_path"], "/ws/0");
+    assert_eq!(body["server"]["join_code"], codes[0]);
+    assert_eq!(body["server"]["paused"], false);
+    assert_eq!(claims(body["ticket"].as_str().unwrap())["srv"], 0);
+    let (character, sid) = who(&body);
+    assert_eq!(s0.join(character, &sid).await.0, StatusCode::OK);
+    status_becomes(&st, &sid, in_game(0)).await;
+    assert_eq!(play_until_ready(&st, &b).await["server"]["slot"], 1);
+}
+
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn stale_generation_gets_unknown_instance(db: PgPool) {
+    let (st, _worker) = connected_with(db, ProvisionerKind::Fake).await;
+    let token = guest(&st).await;
+    let sid = sessions::hash_token(&token)[..16].to_owned();
+    let unknown = (StatusCode::CONFLICT, json!({"error":"unknown_instance"}));
+    let report = |path: &'static str, body: Value| {
+        let st = st.clone();
+        async move {
+            call(
+                internal::router(st),
+                Method::POST,
+                path,
+                Some(TOKEN),
+                Some(body),
+            )
+            .await
+        }
+    };
+    let id = json!({"slot": 0, "generation": 9, "boot_id": "z"});
+    let with = |extra: Value| {
+        let mut body = id.clone();
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    assert_eq!(
+        report(
+            "/internal/v1/servers/heartbeat",
+            with(json!({"players": []}))
+        )
+        .await,
+        unknown
+    );
+    assert_eq!(
+        report(
+            "/internal/v1/servers/join",
+            with(json!({"character_id": 1, "sid": sid}))
+        )
+        .await,
+        unknown
+    );
+    assert_eq!(
+        report(
+            "/internal/v1/servers/leave",
+            with(json!({"character_id": 1}))
+        )
+        .await,
+        unknown
+    );
+    assert_eq!(
+        report(
+            "/internal/v1/servers/shutdown-request",
+            with(json!({"reason": "idle", "players": []}))
+        )
+        .await,
+        unknown
+    );
+}
+
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn static_mode_places_like_today(db: PgPool) {
+    let (st, _worker) = connected(db).await;
+    let _s0 = FakeServer::start(&st, 0, "a", &[]);
+    let _s1 = FakeServer::start(&st, 1, "b", &[]);
+    slots_up(&st, &[0, 1]).await;
+    let mut slots = Vec::new();
+    for _ in 0..2 {
+        let token = guest(&st).await;
+        let (status, body) = play(&st, &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let slot = body["server"]["slot"].as_u64().unwrap();
+        assert_eq!(body["server"]["udp"], format!("localhost:{}", 25555 + slot));
+        assert_eq!(body["server"]["join_code"], Value::Null);
+        slots.push(slot);
+    }
+    slots.sort();
+    assert_eq!(slots, vec![0, 1], "least-loaded spreads players");
+    assert!(fake_calls(&st).is_empty(), "static never spawns");
+    for slot in [0, 1] {
+        assert_eq!(
+            instance_status(&st, slot, 1).await,
+            WorkflowExecutionStatus::Running
+        );
+    }
+}
+
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn idle_shutdown_destroys_the_instance(db: PgPool) {
+    let (st, _worker) = connected_with(db, ProvisionerKind::Fake).await;
+    let (server, token, _, sid) = one_instance_one_player(&st).await;
+    assert_eq!(
+        server.shutdown("idle").await,
+        (StatusCode::OK, json!({"plan":"destroy"}))
+    );
+    let deleted = InstanceIn {
+        slot: 0,
+        generation: 1,
+        join_code: provisioned(&st, 1).await[0].join_code.clone(),
+    };
+    eventually("instance deleted", Duration::from_secs(15), || {
+        let found = fake_calls(&st).contains(&FakeCall::Delete(deleted.clone()));
+        async move { found }
+    })
+    .await;
+    eventually(
+        "instance workflow completed",
+        Duration::from_secs(5),
+        || {
+            let st = st.clone();
+            async move { instance_status(&st, 0, 1).await == WorkflowExecutionStatus::Completed }
+        },
+    )
+    .await;
+    status_becomes(&st, &sid, in_menus()).await;
+    eventually("slot freed", Duration::from_secs(5), || {
+        let st = st.clone();
+        async move {
+            fleet(&st)
+                .await
+                .is_some_and(|f| f.servers.is_empty() && f.index.is_empty())
+        }
+    })
+    .await;
+    // The world is gone: the next play spawns a new instance on the freed slot.
+    assert_eq!(play(&st, &token).await, starting());
+    let calls = provisioned(&st, 2).await;
+    assert_eq!((calls[1].slot, calls[1].generation), (0, 2));
+    let heartbeat = json!({"slot": 0, "generation": 1, "boot_id": "a", "players": []});
+    assert_eq!(
+        call(
+            internal::router(st.clone()),
+            Method::POST,
+            "/internal/v1/servers/heartbeat",
+            Some(TOKEN),
+            Some(heartbeat)
+        )
+        .await,
+        (StatusCode::CONFLICT, json!({"error":"unknown_instance"}))
+    );
+}
+
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn fresh_coordinator_rebuilds_directory_from_running_servers(db: PgPool) {
+    let (st, _worker) = connected_with(db, ProvisionerKind::Fake).await;
+    let (a, b) = (guest(&st).await, guest(&st).await);
+    assert_eq!(play(&st, &a).await, starting());
+    assert_eq!(play(&st, &b).await, starting());
+    provisioned(&st, 2).await;
+    let s0 = FakeServer::start_instance(&st, 0, 1, "a", &[]);
+    let s1 = FakeServer::start_instance(&st, 1, 2, "b", &[]);
+    for (token, server, slot) in [(&a, &s0, 0), (&b, &s1, 1)] {
+        let body = play_until_ready(&st, token).await;
+        let (character, sid) = who(&body);
+        assert_eq!(server.join(character, &sid).await.0, StatusCode::OK);
+        status_becomes(&st, &sid, in_game(slot)).await;
+    }
+    temporal::client(&st)
+        .unwrap()
+        .get_workflow_handle::<CoordinatorWorkflow>(temporal::coordinator_id(
+            &st.config.temporal_task_queue,
+        ))
+        .terminate(WorkflowTerminateOptions::builder().reason("test").build())
+        .await
+        .unwrap();
+    // The returning character is placed on its own instance, not a new one.
+    let (status, body) = play(&st, &a).await;
+    assert_eq!(
+        (status, body["server"]["slot"].clone()),
+        (StatusCode::OK, json!(0)),
+        "{body}"
+    );
+    // A new player gets the next free slot with a generation above both.
+    let c = guest(&st).await;
+    assert_eq!(play(&st, &c).await, starting());
+    let calls = provisioned(&st, 3).await;
+    assert_eq!((calls[2].slot, calls[2].generation), (2, 3));
+}
+
+/// A full managed lifecycle (spawn, ready, join, leave, SIGTERM to the menu, destroy),
+/// then every workflow's history is replayed against this code.
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn live_coordinator_and_server_replay(db: PgPool) {
+    let (st, _worker) = connected_with(db, ProvisionerKind::Fake).await;
+    let (server, _, character, sid) = one_instance_one_player(&st).await;
+    server.leave(character);
+    status_becomes(&st, &sid, in_menus()).await;
+    // Rejoin on the still-valid ticket, then SIGTERM with the player on board.
+    assert_eq!(server.join(character, &sid).await.0, StatusCode::OK);
+    status_becomes(&st, &sid, in_game(0)).await;
+    assert_eq!(
+        server.shutdown("sigterm").await,
+        (StatusCode::OK, json!({"plan":"to_menu"}))
+    );
+    eventually(
+        "instance workflow completed",
+        Duration::from_secs(25),
+        || {
+            let st = st.clone();
+            async move { instance_status(&st, 0, 1).await == WorkflowExecutionStatus::Completed }
+        },
+    )
+    .await;
+    status_becomes(&st, &sid, in_menus()).await;
+    replays_cleanly(&st, &[(0, 1)], &[&sid]).await;
 }
