@@ -219,6 +219,7 @@ mod tests {
             http,
             temporal: Default::default(),
             fake_calls: Default::default(),
+            fake_alive: Arc::new(true.into()),
         }
     }
 

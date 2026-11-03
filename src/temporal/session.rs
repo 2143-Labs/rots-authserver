@@ -16,7 +16,7 @@ use temporalio_sdk::{
 };
 
 use super::activities::{MintArgs, SessionActivities};
-use super::coordinator::{PlaceIn, Placement};
+use super::coordinator::{CrashedIn, PlaceIn, Placement};
 
 /// A session with nobody in game ends after this long; the next `/play` starts a new run.
 pub const IDLE_SECS: u64 = 24 * 3600;
@@ -46,8 +46,16 @@ pub struct PresenceIn {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SessionStatus {
     InMenus,
-    Assigned { slot: u32, expires_at: u64 },
-    InGame { slot: u32 },
+    Assigned {
+        slot: u32,
+        expires_at: u64,
+    },
+    InGame {
+        slot: u32,
+    },
+    /// A client of this session lost its server and reported it; cleared when a character
+    /// joins again.
+    Reconnecting,
     Ended,
 }
 
@@ -85,12 +93,15 @@ pub struct SessionState {
     pub present: BTreeSet<(u32, i64)>,
     pub playing: bool,
     pub ended: bool,
+    pub reconnecting: bool,
 }
 
 impl SessionState {
     pub fn status(&self) -> SessionStatus {
         if self.ended {
             SessionStatus::Ended
+        } else if self.reconnecting {
+            SessionStatus::Reconnecting
         } else if let Some(&(slot, _)) = self.present.first() {
             SessionStatus::InGame { slot }
         } else if let Some((slot, expires_at)) = self.assigned {
@@ -105,6 +116,7 @@ impl SessionState {
         if input.present {
             self.present.insert(pair);
             self.assigned = None;
+            self.reconnecting = false;
         } else {
             self.present.remove(&pair);
         }
@@ -172,6 +184,23 @@ impl PlayerSessionWorkflow {
     #[signal]
     pub fn presence(&mut self, _ctx: &mut SyncWorkflowContext<Self>, input: PresenceIn) {
         self.state.apply_presence(&input);
+    }
+
+    /// The client lost its server: have the character's instance probed. True when a
+    /// probe was requested.
+    #[update]
+    pub async fn server_crashed(ctx: &mut WorkflowContext<Self>, input: CrashedIn) -> bool {
+        ctx.state_mut(|s| s.state.reconnecting = true);
+        ctx.execute_local_activity(
+            SessionActivities::report_crash,
+            input,
+            LocalActivityOptions::builder()
+                .schedule_to_close_timeout(Duration::from_secs(3))
+                .retry_policy(RetryPolicy::builder().maximum_attempts(2).build())
+                .build(),
+        )
+        .await
+        .unwrap_or(false)
     }
 
     #[signal]

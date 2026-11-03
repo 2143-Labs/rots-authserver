@@ -866,7 +866,7 @@ async fn provisioned(st: &AppState, n: usize) -> Vec<InstanceIn> {
             .into_iter()
             .filter_map(|c| match c {
                 FakeCall::Provision(i) => Some(i),
-                FakeCall::Delete(_) => None,
+                _ => None,
             })
             .collect::<Vec<_>>()
     };
@@ -1186,5 +1186,96 @@ async fn live_coordinator_and_server_replay(db: PgPool) {
     )
     .await;
     status_becomes(&st, &sid, in_menus()).await;
+    replays_cleanly(&st, &[(0, 1)], &[&sid]).await;
+}
+
+// ---------------------------------------------------------------- forced failure
+
+fn calls_of(st: &AppState, pick: fn(&FakeCall) -> bool) -> usize {
+    fake_calls(st).iter().filter(|c| pick(c)).count()
+}
+
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn lease_expiry_without_a_probe_failure_kills_nothing(db: PgPool) {
+    let (st, _worker) = connected_with(db, ProvisionerKind::Fake).await;
+    let (server, _, _, sid) = one_instance_one_player(&st).await;
+    // Heartbeats stop (the authserver cannot hear the server), but the server answers.
+    drop(server);
+    eventually("two probes", Duration::from_secs(15), || {
+        let probes = calls_of(&st, |c| matches!(c, FakeCall::Probe(_)));
+        async move { probes >= 2 }
+    })
+    .await;
+    assert_eq!(
+        calls_of(&st, |c| matches!(
+            c,
+            FakeCall::Kill(_) | FakeCall::Delete(_)
+        )),
+        0
+    );
+    assert_eq!(
+        instance_status(&st, 0, 1).await,
+        WorkflowExecutionStatus::Running
+    );
+    assert_eq!(status(&st, &sid).await, in_game(0));
+}
+
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn crash_report_triggers_a_probe(db: PgPool) {
+    let (st, _worker) = connected_with(db, ProvisionerKind::Fake).await;
+    let (server, token, character, sid) = one_instance_one_player(&st).await;
+    // The server hangs: no heartbeats, no answer to the probe.
+    drop(server);
+    st.fake_alive
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        call(
+            create_api(st.clone()),
+            Method::POST,
+            "/api/v1/my-server-crashed",
+            Some(&token),
+            Some(json!({}))
+        )
+        .await,
+        (StatusCode::ACCEPTED, json!({"status":"accepted"}))
+    );
+    eventually("pod killed", Duration::from_secs(10), || {
+        let kills = calls_of(&st, |c| matches!(c, FakeCall::Kill(_)));
+        async move { kills == 1 }
+    })
+    .await;
+    assert!(calls_of(&st, |c| matches!(c, FakeCall::Probe(_))) >= 1);
+    eventually("play says recovering", Duration::from_secs(5), || {
+        let st = st.clone();
+        let token = token.clone();
+        async move {
+            play(&st, &token).await
+                == (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"error":"server_recovering"}),
+                )
+        }
+    })
+    .await;
+    // The pod restarts on the same volume and restores the character as a ghost.
+    let restarted = FakeServer::start_instance(&st, 0, 1, "a2", &[(character, &sid)]);
+    eventually("same instance ready again", Duration::from_secs(10), || {
+        let st = st.clone();
+        let token = token.clone();
+        async move {
+            let (status, body) = play(&st, &token).await;
+            status == StatusCode::OK && body["server"]["slot"] == 0
+        }
+    })
+    .await;
+    assert_eq!(
+        restarted.join(character, &sid).await,
+        (StatusCode::OK, json!({"result":"admitted"}))
+    );
+    status_becomes(&st, &sid, in_game(0)).await;
+    assert_eq!(calls_of(&st, |c| matches!(c, FakeCall::Delete(_))), 0);
+    assert_eq!(provisioned(&st, 1).await.len(), 1, "no new instance");
     replays_cleanly(&st, &[(0, 1)], &[&sid]).await;
 }

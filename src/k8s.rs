@@ -12,7 +12,7 @@ use anyhow::{Context, bail};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
-use crate::temporal::activities::{InstanceHealth, InstanceIn, ProvisionOutcome};
+use crate::temporal::activities::{InstanceHealth, InstanceIn, ProbeResult, ProvisionOutcome};
 
 const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 const API: &str = "https://kubernetes.default.svc";
@@ -105,9 +105,19 @@ impl Kube {
 
     /// 404 (already gone) counts as success.
     pub async fn delete(&self, api: &str, resource: &str, name: &str) -> anyhow::Result<()> {
-        let url = self.url(api, resource, Some(name));
         let opts =
             json!({"kind": "DeleteOptions", "apiVersion": "v1", "propagationPolicy": "Background"});
+        self.delete_with(api, resource, name, opts).await
+    }
+
+    async fn delete_with(
+        &self,
+        api: &str,
+        resource: &str,
+        name: &str,
+        opts: Value,
+    ) -> anyhow::Result<()> {
+        let url = self.url(api, resource, Some(name));
         match self.send(Method::DELETE, &url, Some(&opts)).await? {
             (s, _) if s.is_success() || s == StatusCode::NOT_FOUND => Ok(()),
             (s, body) => bail!("DELETE {url}: {s}: {}", body["message"]),
@@ -306,6 +316,38 @@ pub async fn instance_health(kube: &Kube, input: &InstanceIn) -> anyhow::Result<
     } else {
         InstanceHealth::Scheduled
     })
+}
+
+/// `GET <url>` answered 200 within 2 s.
+pub async fn healthz(http: &reqwest::Client, url: &str) -> ProbeResult {
+    match http.get(url).timeout(Duration::from_secs(2)).send().await {
+        Ok(resp) if resp.status().is_success() => ProbeResult::Alive,
+        _ => ProbeResult::Dead,
+    }
+}
+
+/// The pod's `/healthz` on its health port; no pod or no pod IP means dead.
+pub async fn probe(
+    kube: &Kube,
+    http: &reqwest::Client,
+    input: &InstanceIn,
+) -> anyhow::Result<ProbeResult> {
+    let pod = format!("{}-0", instance_name(input.slot, input.generation));
+    let Some(pod) = kube.get_json("/api/v1", "pods", &pod).await? else {
+        return Ok(ProbeResult::Dead);
+    };
+    let Some(ip) = pod["status"]["podIP"].as_str() else {
+        return Ok(ProbeResult::Dead);
+    };
+    Ok(healthz(http, &format!("http://{ip}:25566/healthz")).await)
+}
+
+/// Deletes the instance's pod at once (`gracePeriodSeconds: 0`); the StatefulSet
+/// recreates it on the same PVC.
+pub async fn kill_pod(kube: &Kube, input: &InstanceIn) -> anyhow::Result<()> {
+    let pod = format!("{}-0", instance_name(input.slot, input.generation));
+    let opts = json!({"kind": "DeleteOptions", "apiVersion": "v1", "gracePeriodSeconds": 0});
+    kube.delete_with("/api/v1", "pods", &pod, opts).await
 }
 
 pub async fn delete_instance(kube: &Kube, input: &InstanceIn) -> anyhow::Result<()> {

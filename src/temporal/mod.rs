@@ -346,6 +346,44 @@ pub async fn play(st: &AppState, s: &SessionRow) -> Result<PlayOutcome, ApiError
     }
 }
 
+/// Runs the session's `server_crashed` update (starting its workflow if needed): the
+/// client lost its server. Errors are only logged; the client polls `/play` regardless.
+pub async fn server_crashed(st: &AppState, s: &SessionRow) {
+    let Ok(client) = client(st) else {
+        tracing::warn!("my-server-crashed: temporal unavailable");
+        return;
+    };
+    let queue = &st.config.temporal_task_queue;
+    let sid = s.token_hash[..16].to_owned();
+    let options = WorkflowUpdateWithStartOptions::new(
+        queue.clone(),
+        session_id(queue, &sid),
+        WorkflowIdConflictPolicy::UseExisting,
+    )
+    .id_reuse_policy(WorkflowIdReusePolicy::AllowDuplicate)
+    .execution_timeout(session::EXECUTION_TIMEOUT)
+    .build();
+    let call = client.execute_update_with_start_workflow(
+        PlayerSessionWorkflow::run,
+        SessionArgs { sid: sid.clone() },
+        PlayerSessionWorkflow::server_crashed,
+        coordinator::CrashedIn {
+            character_id: s.character_id,
+        },
+        options,
+    );
+    match tokio::time::timeout(PLAY_TIMEOUT, call).await {
+        Ok(Ok(probed)) => tracing::info!(
+            sid,
+            character_id = s.character_id,
+            probed,
+            "server crash reported"
+        ),
+        Ok(Err(e)) => tracing::warn!(sid, "my-server-crashed: session update failed: {e:#}"),
+        Err(_) => tracing::warn!(sid, "my-server-crashed: session update timed out"),
+    }
+}
+
 /// Tells a session's workflow it is over (logout or replaced by a new login). Fire and
 /// forget: the workflow may never have started, and the caller's response must not wait.
 pub fn signal_logout(st: &AppState, sid: &str) {

@@ -25,12 +25,13 @@ use serde::{Deserialize, Serialize};
 use temporalio_common::RetryPolicy;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    CancellableFuture, ContinueAsNewOptions, LocalActivityOptions, SyncWorkflowContext,
-    WorkflowContext, WorkflowContextView, WorkflowResult,
+    CancellableFuture, ContinueAsNewOptions, LocalActivityOptions, SignalWorkflowOptions,
+    SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
 };
 
 use super::activities::{GameServerActivities, ProvisionerKind, StartServerIn};
 use super::now_secs;
+use super::server::GameServerWorkflow;
 use super::server::ServerInfo;
 
 /// How long an assignment holds a slot for a player who has not joined yet: the
@@ -114,6 +115,21 @@ pub enum Effect {
         generation: u64,
         join_code: Option<String>,
     },
+    /// Ask the instance's workflow to probe its server now.
+    Probe(InstanceRef),
+}
+
+/// One instance: `(slot, generation)`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstanceRef {
+    pub slot: u32,
+    pub generation: u64,
+}
+
+/// A client lost its server and asks for it to be checked.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CrashedIn {
+    pub character_id: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -607,6 +623,37 @@ impl FleetState {
         }
     }
 
+    /// A client lost the server its character is on: have that instance probed. False
+    /// when the character is on no live, ready instance.
+    pub fn server_crashed(&mut self, input: &CrashedIn) -> bool {
+        let Some(b) = self.index.get(&input.character_id) else {
+            return false;
+        };
+        let target = InstanceRef {
+            slot: b.slot,
+            generation: b.generation,
+        };
+        if !self
+            .entry(target.slot, target.generation)
+            .is_some_and(|e| e.phase == Phase::Ready)
+        {
+            return false;
+        }
+        self.outbox.push(Effect::Probe(target));
+        true
+    }
+
+    /// The instance's server did not answer its probe and its pod was killed; it is
+    /// restarting on the same volume.
+    pub fn server_recovering(&mut self, input: &InstanceRef) {
+        if let Some(e) = self.servers.get_mut(&input.slot)
+            && e.generation == input.generation
+            && e.phase == Phase::Ready
+        {
+            e.phase = Phase::Recovering;
+        }
+    }
+
     /// Merges the running instances found at startup. Entries already known (from a
     /// report that arrived first) are kept.
     pub fn rebuild(&mut self, found: &[ServerInfo]) {
@@ -706,11 +753,31 @@ impl CoordinatorWorkflow {
             while let Some(effect) =
                 ctx.state_mut(|s| (!s.fleet.outbox.is_empty()).then(|| s.fleet.outbox.remove(0)))
             {
-                let Effect::StartServer {
-                    slot,
-                    generation,
-                    join_code,
-                } = effect;
+                let (slot, generation, join_code) = match effect {
+                    Effect::StartServer {
+                        slot,
+                        generation,
+                        join_code,
+                    } => (slot, generation, join_code),
+                    Effect::Probe(instance) => {
+                        let queue = ctx.state(|s| s.args.task_queue.clone());
+                        let sent = ctx
+                            .external_workflow(
+                                super::server_id(&queue, instance.slot, instance.generation),
+                                None,
+                            )
+                            .signal(
+                                GameServerWorkflow::probe,
+                                (),
+                                SignalWorkflowOptions::default(),
+                            )
+                            .await;
+                        if let Err(e) = sent {
+                            tracing::warn!(?instance, "coordinator: probe not delivered: {e}");
+                        }
+                        continue;
+                    }
+                };
                 let started = ctx
                     .execute_local_activity(
                         GameServerActivities::start_server_workflow,
@@ -808,6 +875,19 @@ impl CoordinatorWorkflow {
         input: ShutdownIn,
     ) -> ShutdownPlan {
         self.fleet.request_shutdown(&input)
+    }
+
+    /// Returns true when a probe of the character's instance was requested.
+    #[update]
+    pub async fn server_crashed(ctx: &mut WorkflowContext<Self>, input: CrashedIn) -> bool {
+        // Before the rebuild the index is empty and every report would look unbound.
+        let _ = ctx.wait_condition(|s: &Self| s.fleet.rebuilt).await;
+        ctx.state_mut(|s| s.fleet.server_crashed(&input))
+    }
+
+    #[signal]
+    pub fn server_recovering(&mut self, _ctx: &mut SyncWorkflowContext<Self>, input: InstanceRef) {
+        self.fleet.server_recovering(&input);
     }
 
     #[query]
@@ -1167,6 +1247,40 @@ mod tests {
                 generation: 8
             }
         );
+    }
+
+    #[test]
+    fn crash_report_probes_the_characters_ready_instance() {
+        let mut f = rebuilt();
+        f.server_ready(&hb(3, 9, &[(1, "s1")]));
+        let crashed = |c| CrashedIn { character_id: c };
+        assert!(f.server_crashed(&crashed(1)));
+        assert_eq!(
+            f.outbox,
+            vec![Effect::Probe(InstanceRef {
+                slot: 3,
+                generation: 9
+            })]
+        );
+        assert!(!f.server_crashed(&crashed(2)), "unbound character");
+        f.server_recovering(&InstanceRef {
+            slot: 3,
+            generation: 9,
+        });
+        assert_eq!(
+            f.place(&place(1, "s1"), &MANAGED, 100),
+            Placement::Recovering {
+                slot: 3,
+                generation: 9
+            }
+        );
+        assert!(!f.server_crashed(&crashed(1)), "already recovering");
+        // Its first heartbeat after the restart makes it ready again.
+        f.server_ready(&hb(3, 9, &[(1, "s1")]));
+        assert!(matches!(
+            f.place(&place(1, "s1"), &MANAGED, 101),
+            Placement::Ready { slot: 3, .. }
+        ));
     }
 
     #[test]

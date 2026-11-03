@@ -193,5 +193,6 @@ pub async fn build_state(config: Config, db: PgPool) -> anyhow::Result<api::AppS
         http,
         temporal: Default::default(),
         fake_calls: Default::default(),
+        fake_alive: Arc::new(true.into()),
     })
 }
