@@ -74,6 +74,9 @@ fn config(temporal_address: Option<String>) -> Config {
         game_server_capacity_per_server: 32,
         game_server_ready_timeout_secs: 120,
         game_server_unschedulable_secs: 30,
+        // `Config::default()` bypasses the clap defaults: a pool instance must not
+        // expire the instant it boots.
+        game_server_warm_max_age_secs: 21600,
         game_udp_port_base: 25555,
         coordinator_stale_secs: 2,
         session_execution_timeout_secs: 48 * 3600,
@@ -96,8 +99,18 @@ async fn connected_with(
     db: PgPool,
     provisioner: ProvisionerKind,
 ) -> (AppState, temporal::WorkerHandle) {
+    connected_config(db, provisioner, 0).await
+}
+
+/// `warm` instances are kept booted in pre-game and handed out on placement.
+async fn connected_config(
+    db: PgPool,
+    provisioner: ProvisionerKind,
+    warm: u32,
+) -> (AppState, temporal::WorkerHandle) {
     let config = Config {
         game_server_provisioner: provisioner,
+        game_server_warm_instances: warm,
         ..config(Some(temporal_address()))
     };
     let st = build_state(config, db).await.unwrap();
@@ -1014,6 +1027,84 @@ async fn new_player_gets_a_new_tutorial_instance(db: PgPool) {
     assert_eq!(play_until_ready(&st, &b).await["server"]["slot"], 1);
 }
 
+/// The pool is filled by the coordinator itself; the next player is placed on a warm
+/// instance on the first `/play` (no `server_starting`), and the hand-out refills the pool.
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn the_second_player_is_placed_on_the_warm_instance(db: PgPool) {
+    let (st, _worker) = connected_config(db, ProvisionerKind::Fake, 1).await;
+    let first = guest(&st).await;
+    assert_eq!(play(&st, &first).await, starting());
+    let calls = provisioned(&st, 2).await;
+    // One instance for the player and one for the pool. Which slot the pool takes depends
+    // on whether the coordinator's own refill (it runs as soon as the directory is
+    // rebuilt, before the first placement) or the placement's refill spawns first.
+    let player = calls
+        .iter()
+        .find(|c| !c.pre_game)
+        .expect("one instance for the player");
+    let pooled = calls
+        .iter()
+        .find(|c| c.pre_game)
+        .expect("one instance for the pool");
+    assert_ne!(
+        (player.slot, player.generation),
+        (pooled.slot, pooled.generation)
+    );
+
+    let _player_server = FakeServer::start_instance(&st, player.slot, player.generation, "a", &[]);
+    let body = play_until_ready(&st, &first).await;
+    assert_eq!(body["server"]["slot"], player.slot, "{body}");
+    assert_eq!(body["server"]["paused"], false);
+    let _pool_server = FakeServer::start_instance(&st, pooled.slot, pooled.generation, "b", &[]);
+    slots_up(&st, &[player.slot, pooled.slot]).await;
+
+    // A second guest is on the warm instance on the first call.
+    let second = guest(&st).await;
+    let started = Instant::now();
+    let (status, body) = play(&st, &second).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(body["server"]["slot"], pooled.slot, "{body}");
+    assert_eq!(body["server"]["paused"], false);
+    // The hand-out reached the instance's workflow: the pool instance is activated.
+    eventually("pool instance activated", Duration::from_secs(10), || {
+        let st = st.clone();
+        async move {
+            !temporal::client(&st)
+                .unwrap()
+                .get_workflow_handle::<GameServerWorkflow>(temporal::server_id(
+                    &st.config.temporal_task_queue,
+                    pooled.slot,
+                    pooled.generation,
+                ))
+                .query(
+                    GameServerWorkflow::server,
+                    (),
+                    WorkflowQueryOptions::default(),
+                )
+                .await
+                .unwrap()
+                .warm
+        }
+    })
+    .await;
+
+    // Handing it out refilled the pool: one new instance, in pre-game, on the next slot.
+    let calls = provisioned(&st, 3).await;
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(calls[2].pre_game, "{calls:?}");
+    assert_eq!((calls[2].slot, calls[2].generation), (2, 3));
+    // The handed-out instance is out of the pool.
+    let f = fleet(&st).await.unwrap();
+    assert!(!f.servers[&pooled.slot].warm);
+    assert_eq!(f.servers.values().filter(|e| e.warm).count(), 1);
+}
+
 #[sqlx::test]
 #[ignore = "needs Postgres + Temporal"]
 async fn stale_generation_gets_unknown_instance(db: PgPool) {
@@ -1117,6 +1208,7 @@ async fn idle_shutdown_destroys_the_instance(db: PgPool) {
         slot: 0,
         generation: 1,
         join_code: provisioned(&st, 1).await[0].join_code.clone(),
+        pre_game: false,
     };
     eventually("instance deleted", Duration::from_secs(15), || {
         let found = fake_calls(&st).contains(&FakeCall::Delete(deleted.clone()));

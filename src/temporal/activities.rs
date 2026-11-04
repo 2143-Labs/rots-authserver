@@ -103,6 +103,9 @@ pub struct StartServerIn {
     pub slot: u32,
     pub generation: u64,
     pub join_code: Option<String>,
+    /// Start it in pre-game, as a warm pool instance.
+    #[serde(default)]
+    pub warm: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -110,6 +113,9 @@ pub struct InstanceIn {
     pub slot: u32,
     pub generation: u64,
     pub join_code: Option<String>,
+    /// Boot the container in pre-game (warm pool instances only).
+    #[serde(default)]
+    pub pre_game: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -216,7 +222,13 @@ impl GameServerActivities {
         .id_reuse_policy(WorkflowIdReusePolicy::RejectDuplicate)
         .run_timeout(super::server::RUN_TIMEOUT)
         .build();
-        let args = super::server_args(st, input.slot, input.generation, input.join_code);
+        let args = super::server_args(
+            st,
+            input.slot,
+            input.generation,
+            input.join_code,
+            input.warm,
+        );
         match client
             .start_workflow(GameServerWorkflow::run, args, options)
             .await
@@ -293,6 +305,9 @@ impl GameServerActivities {
                             paused: false,
                             connected: 0,
                             players: Vec::new(),
+                            // Not known: a stranded pool instance is never handed out and
+                            // its own workflow retires it.
+                            warm: false,
                         })
                     }
                 }
@@ -424,6 +439,51 @@ impl GameServerActivities {
                 Ok(())
             }
             ProvisionerKind::Kubernetes => Ok(k8s::kill_pod(self.kube()?, &input).await?),
+        }
+    }
+
+    /// Tells a pool instance the coordinator is handing it to a player.
+    #[activity]
+    pub async fn activate_instance(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: InstanceIn,
+    ) -> Result<(), ActivityError> {
+        match self.kind() {
+            ProvisionerKind::Kubernetes => {
+                k8s::activate(
+                    self.kube()?,
+                    &self.state.http,
+                    &self.state.config.coordinator_token,
+                    &input,
+                )
+                .await?;
+                Ok(())
+            }
+            ProvisionerKind::Static | ProvisionerKind::Fake => Ok(()),
+        }
+    }
+
+    /// Whether a warm instance still runs the image a fresh pod would pull.
+    #[activity]
+    pub async fn warm_is_current(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: InstanceIn,
+    ) -> Result<bool, ActivityError> {
+        match self.kind() {
+            ProvisionerKind::Kubernetes => {
+                Ok(k8s::warm_is_current(self.kube()?, &self.state.http, &input)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            ?input,
+                            "warm: image check failed, keeping the instance: {e:#}"
+                        );
+                        true
+                    }))
+            }
+            ProvisionerKind::Static | ProvisionerKind::Fake => Ok(true),
         }
     }
 

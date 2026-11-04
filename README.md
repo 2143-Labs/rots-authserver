@@ -69,6 +69,8 @@ unset.
 | `GAME_SERVER_CAPACITY_PER_SERVER` | `32` | Static mode: players in game plus reserved per server before it counts as full. |
 | `GAME_SERVER_READY_TIMEOUT_SECS` | `120` | A spawned instance with no heartbeat by then is deleted. |
 | `GAME_SERVER_UNSCHEDULABLE_SECS` | `30` | A spawned instance whose pod cannot be scheduled for this long is deleted, and `/play` answers `servers_full` for 30 s. |
+| `GAME_SERVER_WARM_INSTANCES` | `0` | Managed mode: instances kept booted in pre-game (sockets and the coordinator link up, world paused) and activated when a player is placed on one, so `/play` answers with a ticket in ~1 s. Each costs a slot and a pod. |
+| `GAME_SERVER_WARM_MAX_AGE_SECS` | `21600` | An unclaimed warm instance older than this is destroyed and replaced. |
 | `GAME_UDP_HOST` | host of `PUBLIC_URL` | Host in `/play`'s `server.udp`. |
 | `GAME_UDP_PORT_BASE` | `25555` | Slot N's UDP port is this + N. |
 | `COORDINATOR_STALE_SECS` | `30` | A game server's lease: one heartbeat renews it for this long. When it lapses the server's `/healthz` is probed: an answer re-arms the lease; no answer kills a managed instance's pod (it restarts on the same volume) or ends a static server's workflow. |
@@ -116,6 +118,8 @@ than 10 minutes), `provider_error` and `internal`.
 which asks the coordinator's `place` update where the character plays. First match wins:
 - the instance the character is on (`server_starting` while it starts, `server_recovering` while it restarts);
 - the instance reserved for it by an earlier `/play`;
+- managed mode: a warm instance from the pool (`GAME_SERVER_WARM_INSTANCES`), activated at
+  once (`200`, no `server_starting`), and the pool is refilled behind it;
 - managed mode: a new instance on the lowest free slot (`server_starting`; ask again every
   2 s), unless the cluster was full in the last 30 s (`servers_full`; ask again every 5 s)
   or three spawns in a row failed (`no_game_server` for 300 s);

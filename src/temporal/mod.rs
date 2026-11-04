@@ -31,7 +31,7 @@ use tokio::sync::watch;
 use crate::api::{ApiError, AppState};
 use crate::sessions::SessionRow;
 use activities::{GameServerActivities, ProvisionerKind, SessionActivities};
-use coordinator::{CoordinatorArgs, CoordinatorWorkflow};
+use coordinator::{CoordinatorArgs, CoordinatorWorkflow, PoolIn};
 use server::{GameServerArgs, GameServerWorkflow};
 use session::{PlayIn, PlayOutcome, PlayerSessionWorkflow, SessionArgs};
 
@@ -92,15 +92,18 @@ fn coordinator_args(st: &AppState) -> CoordinatorArgs {
         slots: c.game_server_slots,
         capacity_per_server: c.game_server_capacity_per_server,
         ready_timeout_secs: c.game_server_ready_timeout_secs,
+        warm_instances: c.game_server_warm_instances,
         carried: None,
     }
 }
 
+/// `warm` is set only by the coordinator's pool; static servers never have it.
 pub fn server_args(
     st: &AppState,
     slot: u32,
     generation: u64,
     join_code: Option<String>,
+    warm: bool,
 ) -> GameServerArgs {
     let c = &st.config;
     GameServerArgs {
@@ -112,6 +115,8 @@ pub fn server_args(
         stale_secs: c.coordinator_stale_secs,
         ready_timeout_secs: c.game_server_ready_timeout_secs,
         unschedulable_secs: c.game_server_unschedulable_secs,
+        warm,
+        warm_max_age_secs: c.game_server_warm_max_age_secs,
         carried: None,
     }
 }
@@ -155,7 +160,7 @@ where
         client
             .signal_with_start_workflow(
                 GameServerWorkflow::run,
-                server_args(st, slot, generation, None),
+                server_args(st, slot, generation, None, false),
                 signal,
                 input,
                 options,
@@ -225,7 +230,7 @@ where
         client
             .execute_update_with_start_workflow(
                 GameServerWorkflow::run,
-                server_args(st, slot, generation, None),
+                server_args(st, slot, generation, None, false),
                 update,
                 input,
                 options,
@@ -511,6 +516,33 @@ async fn run_worker(
         config.temporal_namespace,
         config.temporal_task_queue
     );
+    // Publishes the pool size the worker started with: a running coordinator carries its
+    // start-time args verbatim across continue-as-new, so a changed value (a rollback to
+    // 0 included) only reaches it through this update.
+    if config.game_server_provisioner == ProvisionerKind::Kubernetes {
+        let state = state.clone();
+        let warm = config.game_server_warm_instances;
+        tokio::spawn(async move {
+            // The worker must be polling before an update on the coordinator is processed.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            for attempt in 1..=5 {
+                let call = coordinator_update(
+                    &state,
+                    CoordinatorWorkflow::configure,
+                    PoolIn {
+                        warm_instances: warm,
+                    },
+                );
+                match call.await {
+                    Ok(_) => return,
+                    Err(e) => {
+                        tracing::warn!("coordinator configure (attempt {attempt}): {e:#}")
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    }
     let shutdown = worker.shutdown_handle();
     let mut run = std::pin::pin!(worker.run());
     tokio::select! {

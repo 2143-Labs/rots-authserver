@@ -53,6 +53,8 @@ pub const TO_MENU_GRACE_SECS: u64 = 15;
 /// A server's pod is killed at most this often; a dead server inside the window is
 /// probed again on the next lapse instead.
 pub const KILL_BACKOFF_SECS: u64 = 300;
+/// How often a warm instance checks that it still runs the image a fresh pod would pull.
+pub const WARM_CHECK_SECS: u64 = 60;
 
 fn one() -> u64 {
     1
@@ -68,6 +70,12 @@ pub struct GameServerArgs {
     pub stale_secs: u64,
     pub ready_timeout_secs: u64,
     pub unschedulable_secs: u64,
+    /// Provisioned into the warm pool: boot in pre-game and wait for activation.
+    #[serde(default)]
+    pub warm: bool,
+    /// How long an unclaimed warm instance may live.
+    #[serde(default)]
+    pub warm_max_age_secs: u64,
     pub carried: Option<ServerState>,
 }
 
@@ -131,12 +139,17 @@ pub struct ServerInfo {
     pub paused: bool,
     pub connected: u32,
     pub players: Vec<PlayerRef>,
+    /// In the warm pool: not handed to a player yet.
+    #[serde(default)]
+    pub warm: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ServerEffect {
     Presence(PresenceTo),
     Report(CoordinatorReport),
+    /// POST `/activate` on the instance, so its world leaves pre-game.
+    Activate,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -179,6 +192,15 @@ pub struct ServerState {
     pub connected: u32,
     pub paused: bool,
     pub udp_port: Option<u16>,
+    /// In the warm pool: the coordinator may hand this instance to a player.
+    #[serde(default)]
+    pub warm: bool,
+    /// The next image-versus-registry check (warm only).
+    #[serde(default)]
+    pub next_warm_check: u64,
+    /// When an unclaimed warm instance is destroyed and replaced.
+    #[serde(default)]
+    pub warm_deadline: u64,
     pub outbox: Vec<ServerEffect>,
 }
 
@@ -203,6 +225,10 @@ impl ServerState {
             connected: 0,
             paused: false,
             udp_port: None,
+            warm: args.warm,
+            // The pool's clocks start at boot, not at activation.
+            next_warm_check: now + WARM_CHECK_SECS,
+            warm_deadline: now + args.warm_max_age_secs,
             outbox: Vec::new(),
         }
     }
@@ -217,6 +243,7 @@ impl ServerState {
             paused: self.paused,
             connected: self.connected,
             players: self.players(),
+            warm: self.warm,
         }
     }
 
@@ -319,6 +346,11 @@ impl ServerState {
                 .push(ServerEffect::Report(CoordinatorReport::Ready(
                     self.report(args),
                 )));
+            // A placed instance whose process restarted into pre-game (a pod recreated
+            // before its first snapshot) has to be activated again.
+            if !self.warm && args.warm {
+                self.outbox.push(ServerEffect::Activate);
+            }
         } else if changed {
             self.outbox
                 .push(ServerEffect::Report(CoordinatorReport::Status(
@@ -336,6 +368,18 @@ impl ServerState {
             self.presence(old, character_id, false);
         }
         self.presence(sid.to_owned(), character_id, true);
+        // A player who connects before the coordinator's push is never stranded in a
+        // paused world.
+        self.activated();
+    }
+
+    /// The coordinator is handing this instance to a player: leave the pool and go online.
+    pub fn activated(&mut self) {
+        if self.phase != Phase::Draining && self.warm {
+            self.warm = false;
+            self.next_warm_check = 0;
+            self.outbox.push(ServerEffect::Activate);
+        }
     }
 
     /// Only the boot that admitted a player can report it leaving.
@@ -378,7 +422,7 @@ impl ServerState {
 
     /// When the run loop must look at the clock again.
     pub fn next_wake(&self, args: &GameServerArgs) -> u64 {
-        match self.phase {
+        let wake = match self.phase {
             Phase::Provisioning if args.provisioner == ProvisionerKind::Kubernetes => {
                 self.ready_deadline.min(self.next_check)
             }
@@ -388,6 +432,13 @@ impl ServerState {
             Phase::Ready => self.lease_until.min(self.next_status),
             Phase::Recovering => self.recover_deadline,
             Phase::Draining => self.destroy_at,
+        };
+        // The pool's clocks only matter while the instance serves unclaimed; every other
+        // phase has a deadline of its own, and waking for a clock `due` ignores would spin.
+        if self.warm && self.phase == Phase::Ready {
+            wake.min(self.next_warm_check.min(self.warm_deadline))
+        } else {
+            wake
         }
     }
 
@@ -468,7 +519,12 @@ enum Due {
     CheckInstance,
     SendStatus,
     Probe,
-    End { delete: bool, reason: GoneReason },
+    /// A warm instance: destroy it at its max age, or if it runs a stale image.
+    CheckWarm,
+    End {
+        delete: bool,
+        reason: GoneReason,
+    },
 }
 
 fn due(state: &ServerState, args: &GameServerArgs, now: u64) -> Due {
@@ -489,6 +545,12 @@ fn due(state: &ServerState, args: &GameServerArgs, now: u64) -> Due {
             Due::CheckInstance
         }
         Phase::Ready if state.probe_requested || now >= state.lease_until => Due::Probe,
+        // A dead warm pod is probed and killed first, as any instance is.
+        Phase::Ready if state.warm && now >= state.warm_deadline => Due::End {
+            delete: managed,
+            reason: GoneReason::Destroyed,
+        },
+        Phase::Ready if state.warm && now >= state.next_warm_check => Due::CheckWarm,
         Phase::Recovering if now >= state.recover_deadline => Due::End {
             delete: managed,
             reason: GoneReason::Lost,
@@ -516,6 +578,9 @@ impl GameServerWorkflow {
             slot: self.args.slot,
             generation: self.args.generation,
             join_code: self.args.join_code.clone(),
+            // Constant for the instance's life: a restart re-enters pre-game only when it
+            // has no snapshot, and the re-activate above covers a placed one.
+            pre_game: self.args.warm,
         }
     }
 }
@@ -553,6 +618,22 @@ async fn drain(ctx: &mut WorkflowContext<GameServerWorkflow>) {
                         SignalWorkflowOptions::default(),
                     )
                     .await;
+            }
+            ServerEffect::Activate => {
+                let instance = ctx.state(|s| s.instance());
+                if let Err(e) = ctx
+                    .execute_local_activity(
+                        GameServerActivities::activate_instance,
+                        instance.clone(),
+                        la(10, 3),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        ?instance,
+                        "game-server workflow: activate not delivered: {e}"
+                    );
+                }
             }
             ServerEffect::Report(report) => {
                 // Signal-with-start: a terminated coordinator is recreated, not lost.
@@ -627,6 +708,10 @@ impl GameServerWorkflow {
             ctx.state_mut(|s| {
                 s.state.ready_deadline = started + s.args.ready_timeout_secs;
                 s.state.next_check = started + INSTANCE_CHECK_SECS;
+                // The init has no clock either: a pool instance's clocks start at boot,
+                // not at epoch zero.
+                s.state.next_warm_check = started + WARM_CHECK_SECS;
+                s.state.warm_deadline = started + s.args.warm_max_age_secs;
             });
         }
         let provisioner = ctx.state(|s| s.args.provisioner);
@@ -726,6 +811,34 @@ impl GameServerWorkflow {
                         }
                     }
                 }
+                Due::CheckWarm => {
+                    let now = now_secs(ctx.workflow_time());
+                    if now >= ctx.state(|s| s.state.warm_deadline) {
+                        return end(ctx, true, GoneReason::Destroyed).await;
+                    }
+                    let instance = ctx.state(|s| s.instance());
+                    let current = ctx
+                        .execute_local_activity(
+                            GameServerActivities::warm_is_current,
+                            instance.clone(),
+                            la(15, 2),
+                        )
+                        .await
+                        // An activity that cannot run says nothing about the image.
+                        .unwrap_or(true);
+                    // An `activate` signal can land while the activity runs: a handed-out
+                    // instance must never be retired.
+                    let still_warm = ctx.state(|s| s.state.warm);
+                    if still_warm && !current {
+                        tracing::info!(
+                            ?instance,
+                            "game-server workflow: warm instance runs a stale image, replacing it"
+                        );
+                        return end(ctx, true, GoneReason::Destroyed).await;
+                    }
+                    let now = now_secs(ctx.workflow_time());
+                    ctx.state_mut(|s| s.state.next_warm_check = now + WARM_CHECK_SECS);
+                }
                 Due::End { delete, reason } => return end(ctx, delete, reason).await,
             }
             // Checked on every wake, not only when the timer fires.
@@ -765,6 +878,12 @@ impl GameServerWorkflow {
         if self.state.phase == Phase::Ready {
             self.state.probe_requested = true;
         }
+    }
+
+    /// The coordinator is handing this instance to a player.
+    #[signal]
+    pub fn activate(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _input: ()) {
+        self.state.activated();
     }
 
     /// Claims the character at the coordinator, then records it here.
@@ -853,8 +972,23 @@ mod tests {
             stale_secs: 30,
             ready_timeout_secs: 120,
             unschedulable_secs: 30,
+            warm: false,
+            warm_max_age_secs: 0,
             carried: None,
         }
+    }
+
+    /// A pool instance: booted in pre-game, unclaimed for 6 h at most.
+    fn warm_args() -> GameServerArgs {
+        GameServerArgs {
+            warm: true,
+            warm_max_age_secs: 21600,
+            ..args(ProvisionerKind::Kubernetes)
+        }
+    }
+
+    fn activates(s: &ServerState) -> bool {
+        s.outbox.iter().any(|e| matches!(e, ServerEffect::Activate))
     }
 
     fn hb(boot: &str, players: &[(i64, &str)], connected: u32) -> HeartbeatIn {
@@ -880,7 +1014,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 ServerEffect::Report(r) => Some(r),
-                ServerEffect::Presence(_) => None,
+                ServerEffect::Presence(_) | ServerEffect::Activate => None,
             })
             .collect()
     }
@@ -1120,6 +1254,102 @@ mod tests {
                 ..
             })]
         ));
+    }
+
+    #[test]
+    fn a_warm_instance_reports_and_stays_warm() {
+        let a = warm_args();
+        let mut s = ServerState::new(&a, 0);
+        assert_eq!((s.warm, s.warm_deadline), (true, 21600));
+        assert_eq!(s.next_warm_check, WARM_CHECK_SECS);
+        s.heartbeat(&a, &hb("b", &[], 0), 10);
+        assert_eq!(s.phase, Phase::Ready);
+        assert!(s.warm, "a report never re-pools or un-pools");
+        assert!(matches!(reports(&s)[..], [CoordinatorReport::Ready(_)]));
+        assert!(!activates(&s), "nobody claimed it");
+    }
+
+    #[test]
+    fn activate_pushes_and_clears_warm() {
+        let a = warm_args();
+        let mut s = ServerState::new(&a, 0);
+        s.heartbeat(&a, &hb("b", &[], 0), 10);
+        s.outbox.clear();
+        s.activated();
+        assert!(!s.warm);
+        assert_eq!(s.next_warm_check, 0);
+        assert!(activates(&s));
+        // Idempotent: a second claim (or a draining instance) changes nothing.
+        s.outbox.clear();
+        s.activated();
+        assert!(s.outbox.is_empty());
+        // A draining instance is not revived out of pre-game.
+        let mut d = ServerState::new(&warm_args(), 0);
+        d.draining(&ShutdownPlan::Destroy, 10);
+        d.outbox.clear();
+        d.activated();
+        assert!(d.warm && d.outbox.is_empty());
+    }
+
+    #[test]
+    fn an_admitted_player_clears_warm() {
+        let a = warm_args();
+        let mut s = ServerState::new(&a, 0);
+        s.heartbeat(&a, &hb("b", &[], 0), 10);
+        s.outbox.clear();
+        // The player's client connected before the coordinator's push.
+        s.admitted(&a, 1, "s1", 11);
+        assert!(!s.warm);
+        assert!(activates(&s));
+    }
+
+    #[test]
+    fn a_placed_instance_that_restarts_is_activated_again() {
+        let a = warm_args();
+        let mut s = ServerState::new(&a, 0);
+        s.heartbeat(&a, &hb("b", &[], 0), 10);
+        s.activated();
+        s.outbox.clear();
+        // The pod is recreated before its first snapshot: it comes back pre-game.
+        s.killed(&a, 40);
+        assert_eq!(s.phase, Phase::Recovering);
+        s.outbox.clear();
+        s.heartbeat(&a, &hb("c", &[], 0), 50);
+        assert_eq!(s.phase, Phase::Ready);
+        assert!(!s.warm);
+        assert!(activates(&s));
+        // A normal (never-warm) instance is never activated.
+        let b = args(ProvisionerKind::Kubernetes);
+        let mut n = ServerState::new(&b, 0);
+        n.heartbeat(&b, &hb("b", &[], 0), 10);
+        n.killed(&b, 20);
+        n.outbox.clear();
+        n.heartbeat(&b, &hb("c", &[], 0), 30);
+        assert!(!activates(&n));
+    }
+
+    #[test]
+    fn a_warm_instance_expires_at_its_max_age() {
+        let a = warm_args();
+        let mut s = ServerState::new(&a, 0);
+        s.heartbeat(&a, &hb("b", &[], 0), 10);
+        // Keep the lease and the status report out of the way.
+        s.lease_until = 100_000;
+        s.next_status = 100_000;
+        assert_eq!(s.next_wake(&a), WARM_CHECK_SECS);
+        assert_eq!(due(&s, &a, WARM_CHECK_SECS), Due::CheckWarm);
+        assert_eq!(
+            due(&s, &a, 21600),
+            Due::End {
+                delete: true,
+                reason: GoneReason::Destroyed
+            }
+        );
+        // Not checked before either clock.
+        assert_eq!(due(&s, &a, WARM_CHECK_SECS - 1), Due::Nothing);
+        // A handed-out instance has no pool clock left.
+        s.activated();
+        assert_eq!(s.next_wake(&a), 100_000);
     }
 
     #[test]
