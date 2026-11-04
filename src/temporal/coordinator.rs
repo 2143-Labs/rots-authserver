@@ -60,6 +60,9 @@ pub struct CoordinatorArgs {
     /// Static mode: players (bound plus reserved) per server before it counts as full.
     pub capacity_per_server: u32,
     pub ready_timeout_secs: u64,
+    /// Managed mode: instances kept booted in pre-game and activated on placement.
+    #[serde(default)]
+    pub warm_instances: u32,
     pub carried: Option<FleetState>,
 }
 
@@ -89,6 +92,10 @@ pub struct ServerEntry {
     pub udp_port: Option<u16>,
     pub paused: bool,
     pub connected: u32,
+    /// In the warm pool: booted in pre-game, waiting to be handed to a player. Never set
+    /// by a report (an in-flight `server_status` after a hand-out must not re-pool it).
+    #[serde(default)]
+    pub warm: bool,
 }
 
 /// Where a character is: the instance whose world holds its units.
@@ -114,9 +121,14 @@ pub enum Effect {
         slot: u32,
         generation: u64,
         join_code: Option<String>,
+        /// Start it in pre-game, as a pool instance.
+        #[serde(default)]
+        warm: bool,
     },
     /// Ask the instance's workflow to probe its server now.
     Probe(InstanceRef),
+    /// Tell the instance's workflow the coordinator is handing it to a player.
+    Activate(InstanceRef),
 }
 
 /// One instance: `(slot, generation)`.
@@ -300,6 +312,14 @@ pub struct Rules {
     pub slots: u32,
     pub capacity_per_server: u32,
     pub ready_timeout_secs: u64,
+    /// Instances kept booted in pre-game.
+    pub warm_instances: u32,
+}
+
+/// The pool size a worker started with (`configure`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct PoolIn {
+    pub warm_instances: u32,
 }
 
 fn splitmix64(mut x: u64) -> u64 {
@@ -370,9 +390,56 @@ impl FleetState {
         }
     }
 
+    /// Tops the pool up to `rules.warm_instances`. A warm instance is a slot with
+    /// `warm: true` that no character is bound or reserved to.
+    fn refill(&mut self, rules: &Rules, now: u64) {
+        // Before the rebuild the directory is empty: filling now would spawn a second
+        // instance on a slot that already has one.
+        if !self.rebuilt {
+            return;
+        }
+        if !rules.managed || now < self.full_until || now < self.spawn_paused_until {
+            return;
+        }
+        let want = rules.warm_instances as usize;
+        while self.servers.values().filter(|e| e.warm).count() < want {
+            let Some(slot) = (0..rules.slots).find(|s| !self.servers.contains_key(s)) else {
+                return;
+            };
+            let generation = self.next_generation;
+            self.next_generation += 1;
+            let join_code = Some(self.new_join_code());
+            self.servers.insert(
+                slot,
+                ServerEntry {
+                    generation,
+                    phase: Phase::Provisioning,
+                    join_code: join_code.clone(),
+                    udp_port: None,
+                    paused: false,
+                    connected: 0,
+                    warm: true,
+                },
+            );
+            self.outbox.push(Effect::StartServer {
+                slot,
+                generation,
+                join_code,
+                warm: true,
+            });
+        }
+    }
+
     /// First match wins: the character's instance, its reservation, its location (not
-    /// built), a new instance (managed) or the least-loaded ready server (static).
+    /// built), a warm pool instance, a new instance (managed) or the least-loaded ready
+    /// server (static). Every answer tops the pool back up.
     pub fn place(&mut self, input: &PlaceIn, rules: &Rules, now: u64) -> Placement {
+        let placement = self.place_inner(input, rules, now);
+        self.refill(rules, now);
+        placement
+    }
+
+    fn place_inner(&mut self, input: &PlaceIn, rules: &Rules, now: u64) -> Placement {
         let c = input.character_id;
         self.reservations.retain(|_, r| r.until > now);
         if let Some(b) = self.index.get(&c).cloned() {
@@ -402,6 +469,39 @@ impl FleetState {
         }
         // `input.location` would pick the world here; no character has one yet.
         if rules.managed {
+            // A warm instance costs nothing to use and is already booted: hand it out even
+            // when the cluster would refuse a new one.
+            if let Some((slot, generation, join_code, udp_port)) = self
+                .servers
+                .iter()
+                .find(|&(slot, e)| {
+                    // A warm entry no character is bound or reserved to: one that has
+                    // players is already in use, whatever its flags say.
+                    e.warm && e.phase == Phase::Ready && self.load(*slot, e.generation, c) == 0
+                })
+                .map(|(slot, e)| (*slot, e.generation, e.join_code.clone(), e.udp_port))
+            {
+                let e = self.servers.get_mut(&slot).expect("found above");
+                e.warm = false;
+                self.outbox
+                    .push(Effect::Activate(InstanceRef { slot, generation }));
+                self.reservations.insert(
+                    c,
+                    Reservation {
+                        slot,
+                        generation,
+                        sid: input.sid.clone(),
+                        until: now + RESERVATION_SECS,
+                    },
+                );
+                return Placement::Ready {
+                    slot,
+                    generation,
+                    udp_port,
+                    join_code,
+                    paused: false,
+                };
+            }
             if now < self.full_until {
                 return Placement::ServersFull;
             }
@@ -423,12 +523,14 @@ impl FleetState {
                     udp_port: None,
                     paused: false,
                     connected: 0,
+                    warm: false,
                 },
             );
             self.outbox.push(Effect::StartServer {
                 slot,
                 generation,
                 join_code,
+                warm: false,
             });
             self.reservations.insert(
                 c,
@@ -483,6 +585,8 @@ impl FleetState {
                         udp_port: None,
                         paused: false,
                         connected: 0,
+                        // Only `rebuild` can learn that a running instance is warm.
+                        warm: false,
                     },
                 );
                 self.next_generation = self.next_generation.max(generation + 1);
@@ -545,6 +649,13 @@ impl FleetState {
             },
         );
         self.reservations.remove(&input.character_id);
+        // A player the pool did not hand out (it connected before the push) takes the
+        // instance out of the pool, so it is never handed out twice.
+        if let Some(e) = self.servers.get_mut(&input.slot)
+            && e.generation == input.generation
+        {
+            e.warm = false;
+        }
         JoinOutcome::Admitted
     }
 
@@ -668,6 +779,14 @@ impl FleetState {
                 e.paused = info.paused;
                 e.connected = info.connected;
             }
+            // The only place after startup that can turn `warm` back on: an instance whose
+            // workflow still holds it. `place` and `claim` wait for the rebuild, so it
+            // cannot race a hand-out.
+            if let Some(e) = self.servers.get_mut(&info.slot)
+                && e.generation == info.generation
+            {
+                e.warm |= info.warm;
+            }
             self.next_generation = self.next_generation.max(info.generation + 1);
             if info.phase != Phase::Draining {
                 self.adopt_players(info.slot, info.generation, &info.players);
@@ -690,6 +809,7 @@ impl CoordinatorWorkflow {
             slots: self.args.slots,
             capacity_per_server: self.args.capacity_per_server,
             ready_timeout_secs: self.args.ready_timeout_secs,
+            warm_instances: self.args.warm_instances,
         }
     }
 }
@@ -736,6 +856,13 @@ impl CoordinatorWorkflow {
                 s.fleet.next_generation = s.fleet.next_generation.max(found.max_generation + 1);
             });
         }
+        // A fresh coordinator with stale-but-correct args fills the pool before the first
+        // `/play`; a continued one re-fills after a rollout.
+        let now = now_secs(ctx.workflow_time());
+        ctx.state_mut(|s| {
+            let rules = s.rules();
+            s.fleet.refill(&rules, now)
+        });
         loop {
             // Wake at the run deadline or when the outbox fills; a timer that lost the
             // race is cancelled, or it would keep running on the server.
@@ -755,12 +882,31 @@ impl CoordinatorWorkflow {
             while let Some(effect) =
                 ctx.state_mut(|s| (!s.fleet.outbox.is_empty()).then(|| s.fleet.outbox.remove(0)))
             {
-                let (slot, generation, join_code) = match effect {
+                let (slot, generation, join_code, warm) = match effect {
                     Effect::StartServer {
                         slot,
                         generation,
                         join_code,
-                    } => (slot, generation, join_code),
+                        warm,
+                    } => (slot, generation, join_code, warm),
+                    Effect::Activate(instance) => {
+                        let queue = ctx.state(|s| s.args.task_queue.clone());
+                        let sent = ctx
+                            .external_workflow(
+                                super::server_id(&queue, instance.slot, instance.generation),
+                                None,
+                            )
+                            .signal(
+                                GameServerWorkflow::activate,
+                                (),
+                                SignalWorkflowOptions::default(),
+                            )
+                            .await;
+                        if let Err(e) = sent {
+                            tracing::warn!(?instance, "coordinator: activate not delivered: {e}");
+                        }
+                        continue;
+                    }
                     Effect::Probe(instance) => {
                         let queue = ctx.state(|s| s.args.task_queue.clone());
                         let sent = ctx
@@ -780,6 +926,9 @@ impl CoordinatorWorkflow {
                         continue;
                     }
                 };
+                if warm {
+                    tracing::info!(slot, generation, "coordinator: warming the pool");
+                }
                 let started = ctx
                     .execute_local_activity(
                         GameServerActivities::start_server_workflow,
@@ -787,6 +936,7 @@ impl CoordinatorWorkflow {
                             slot,
                             generation,
                             join_code,
+                            warm,
                         },
                         LocalActivityOptions::builder()
                             .schedule_to_close_timeout(Duration::from_secs(15))
@@ -846,7 +996,15 @@ impl CoordinatorWorkflow {
     #[update]
     pub async fn claim(ctx: &mut WorkflowContext<Self>, input: ClaimIn) -> JoinOutcome {
         let _ = ctx.wait_condition(|s: &Self| s.fleet.rebuilt).await;
-        ctx.state_mut(|s| s.fleet.claim(&input))
+        let now = now_secs(ctx.workflow_time());
+        ctx.state_mut(|s| {
+            let rules = s.rules();
+            let outcome = s.fleet.claim(&input);
+            // An admitted player takes its instance out of the pool through its own
+            // workflow: keep the pool topped up.
+            s.fleet.refill(&rules, now);
+            outcome
+        })
     }
 
     #[signal]
@@ -866,8 +1024,21 @@ impl CoordinatorWorkflow {
 
     #[signal]
     pub fn server_gone(&mut self, ctx: &mut SyncWorkflowContext<Self>, input: ServerGoneIn) {
-        self.fleet
-            .server_gone(&input, now_secs(ctx.workflow_time()));
+        let now = now_secs(ctx.workflow_time());
+        let rules = self.rules();
+        self.fleet.server_gone(&input, now);
+        // A destroyed instance must be replaced.
+        self.fleet.refill(&rules, now);
+    }
+
+    /// Applies the pool size the worker started with, and fills the pool for it.
+    #[update]
+    pub fn configure(&mut self, ctx: &mut SyncWorkflowContext<Self>, input: PoolIn) -> u32 {
+        self.args.warm_instances = input.warm_instances;
+        let now = now_secs(ctx.workflow_time());
+        let rules = self.rules();
+        self.fleet.refill(&rules, now);
+        input.warm_instances
     }
 
     #[update]
@@ -907,12 +1078,19 @@ mod tests {
         slots: 4,
         capacity_per_server: 32,
         ready_timeout_secs: 120,
+        warm_instances: 0,
     };
     const STATIC: Rules = Rules {
         managed: false,
         slots: 4,
         capacity_per_server: 2,
         ready_timeout_secs: 120,
+        warm_instances: 0,
+    };
+    /// Managed, with one instance kept in pre-game.
+    const POOLED: Rules = Rules {
+        warm_instances: 1,
+        ..MANAGED
     };
 
     fn place(c: i64, sid: &str) -> PlaceIn {
@@ -1220,6 +1398,7 @@ mod tests {
                     character_id: 1,
                     sid: "s1".into(),
                 }],
+                warm: false,
             },
             ServerInfo {
                 slot: 0,
@@ -1230,6 +1409,7 @@ mod tests {
                 paused: false,
                 connected: 0,
                 players: vec![],
+                warm: false,
             },
         ]);
         assert!(f.rebuilt);
@@ -1283,6 +1463,167 @@ mod tests {
             f.place(&place(1, "s1"), &MANAGED, 101),
             Placement::Ready { slot: 3, .. }
         ));
+    }
+
+    #[test]
+    fn refill_fills_the_pool_to_the_target() {
+        let mut f = rebuilt();
+        let rules = Rules {
+            warm_instances: 2,
+            ..MANAGED
+        };
+        f.refill(&rules, 100);
+        assert_eq!(f.servers.len(), 2);
+        assert!(
+            f.servers
+                .values()
+                .all(|e| e.warm && e.phase == Phase::Provisioning)
+        );
+        assert_eq!(
+            f.outbox,
+            vec![
+                Effect::StartServer {
+                    slot: 0,
+                    generation: 1,
+                    join_code: f.servers[&0].join_code.clone(),
+                    warm: true,
+                },
+                Effect::StartServer {
+                    slot: 1,
+                    generation: 2,
+                    join_code: f.servers[&1].join_code.clone(),
+                    warm: true,
+                },
+            ]
+        );
+        // Nothing more when the pool is full.
+        f.outbox.clear();
+        f.refill(&rules, 101);
+        assert_eq!(f.servers.len(), 2);
+        assert!(f.outbox.is_empty());
+    }
+
+    #[test]
+    fn place_hands_out_a_warm_instance_and_refills() {
+        let mut f = rebuilt();
+        f.refill(&POOLED, 100);
+        f.server_ready(&hb(0, 1, &[]));
+        f.outbox.clear();
+        let answer = f.place(&place(7, "s7"), &POOLED, 110);
+        let Placement::Ready {
+            slot: 0,
+            generation: 1,
+            join_code,
+            paused: false,
+            ..
+        } = answer
+        else {
+            panic!("expected the warm instance, got {answer:?}");
+        };
+        assert!(join_code.is_some());
+        assert_eq!(
+            f.reservations[&7],
+            Reservation {
+                slot: 0,
+                generation: 1,
+                sid: "s7".into(),
+                until: 110 + RESERVATION_SECS,
+            }
+        );
+        assert!(!f.servers[&0].warm, "handed out");
+        // The pool was topped up on the next free slot, in the same call.
+        let refilled = &f.servers[&1];
+        assert!(refilled.warm);
+        assert_eq!(
+            (refilled.generation, refilled.phase),
+            (2, Phase::Provisioning)
+        );
+        assert_eq!(
+            f.outbox,
+            vec![
+                Effect::Activate(InstanceRef {
+                    slot: 0,
+                    generation: 1
+                }),
+                Effect::StartServer {
+                    slot: 1,
+                    generation: 2,
+                    join_code: refilled.join_code.clone(),
+                    warm: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_warm_entry_is_not_handed_out_twice() {
+        let mut f = rebuilt();
+        f.refill(&POOLED, 100);
+        f.server_ready(&hb(0, 1, &[]));
+        assert!(matches!(
+            f.place(&place(1, "s1"), &POOLED, 110),
+            Placement::Ready { slot: 0, .. }
+        ));
+        // The pool's replacement is still provisioning, so the next character waits for a
+        // fresh instance rather than sharing the handed-out one.
+        assert_eq!(
+            f.place(&place(2, "s2"), &POOLED, 111),
+            Placement::Starting {
+                slot: 2,
+                generation: 3
+            }
+        );
+        assert!(
+            !f.servers
+                .values()
+                .any(|e| e.warm && e.phase == Phase::Ready && e.generation == 1)
+        );
+    }
+
+    #[test]
+    fn refill_does_nothing_when_the_cluster_is_full_or_paused() {
+        let mut f = rebuilt();
+        f.full_until = 200;
+        f.refill(&POOLED, 100);
+        assert!(f.servers.is_empty() && f.outbox.is_empty());
+        f.full_until = 0;
+        f.spawn_paused_until = 200;
+        f.refill(&POOLED, 100);
+        assert!(f.servers.is_empty() && f.outbox.is_empty());
+        f.spawn_paused_until = 0;
+        // No room for one at all.
+        for slot in 0..MANAGED.slots {
+            f.server_ready(&hb(slot, 1, &[]));
+        }
+        f.refill(&POOLED, 101);
+        assert!(!f.servers.values().any(|e| e.warm));
+    }
+
+    #[test]
+    fn a_rebuilt_instance_stays_warm() {
+        let mut f = FleetState::default();
+        f.rebuild(&[ServerInfo {
+            slot: 0,
+            generation: 4,
+            join_code: Some("ABCD".into()),
+            phase: Phase::Ready,
+            udp_port: Some(36000),
+            paused: false,
+            connected: 0,
+            players: vec![],
+            warm: true,
+        }]);
+        assert!(f.servers[&0].warm);
+        // A full pool is not topped up again after the rebuild.
+        f.refill(&POOLED, 100);
+        assert_eq!(f.servers.len(), 1);
+        assert!(f.outbox.is_empty());
+        // Handing it out still works and clears the flag.
+        assert!(matches!(
+            f.place(&place(1, "s1"), &POOLED, 101),
+            Placement::Ready { slot: 0, .. }
+        ));
+        assert!(!f.servers[&0].warm);
     }
 
     #[test]

@@ -85,6 +85,12 @@ pub struct Config {
     /// cluster is full: it is deleted and players get `servers_full`.
     #[clap(long, default_value = "30", env)]
     pub game_server_unschedulable_secs: u64,
+    /// Managed mode: instances kept booted in pre-game and activated on placement.
+    #[clap(long, default_value = "0", env)]
+    pub game_server_warm_instances: u32,
+    /// How long an unclaimed warm instance may live before it is destroyed and replaced.
+    #[clap(long, default_value = "21600", env)]
+    pub game_server_warm_max_age_secs: u64,
     /// Host in `/play`'s `server.udp`; unset = the host of `PUBLIC_URL`.
     #[clap(long, env)]
     pub game_udp_host: Option<String>,

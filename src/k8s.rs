@@ -213,6 +213,12 @@ pub fn statefulset(template: &Value, input: &InstanceIn, udp_port: u16) -> Value
             input.join_code.clone().unwrap_or_default(),
         ),
         ("ROTS_PUBLIC_UDP_PORT", udp_port.to_string()),
+        // The game server parses no CLI: pre-game arrives as env, like every other
+        // per-instance value. Empty on a normal instance.
+        (
+            "ROTS_PRE_GAME",
+            if input.pre_game { "1" } else { "" }.to_string(),
+        ),
     ];
     if let Some(containers) = spec["containers"].as_array_mut() {
         let named = containers
@@ -326,20 +332,196 @@ pub async fn healthz(http: &reqwest::Client, url: &str) -> ProbeResult {
     }
 }
 
+/// The instance's pod IP; `None` when the pod does not exist or has none yet.
+async fn pod_ip(kube: &Kube, input: &InstanceIn) -> anyhow::Result<Option<String>> {
+    let pod = format!("{}-0", instance_name(input.slot, input.generation));
+    let Some(pod) = kube.get_json("/api/v1", "pods", &pod).await? else {
+        return Ok(None);
+    };
+    Ok(pod["status"]["podIP"].as_str().map(str::to_owned))
+}
+
 /// The pod's `/healthz` on its health port; no pod or no pod IP means dead.
 pub async fn probe(
     kube: &Kube,
     http: &reqwest::Client,
     input: &InstanceIn,
 ) -> anyhow::Result<ProbeResult> {
-    let pod = format!("{}-0", instance_name(input.slot, input.generation));
-    let Some(pod) = kube.get_json("/api/v1", "pods", &pod).await? else {
-        return Ok(ProbeResult::Dead);
-    };
-    let Some(ip) = pod["status"]["podIP"].as_str() else {
+    let Some(ip) = pod_ip(kube, input).await? else {
         return Ok(ProbeResult::Dead);
     };
     Ok(healthz(http, &format!("http://{ip}:25566/healthz")).await)
+}
+
+/// POSTs `/activate` on the instance's health port, so its pre-game world goes online.
+pub async fn activate(
+    kube: &Kube,
+    http: &reqwest::Client,
+    token: &str,
+    input: &InstanceIn,
+) -> anyhow::Result<()> {
+    let Some(ip) = pod_ip(kube, input).await? else {
+        bail!(
+            "{}: no pod IP to activate",
+            instance_name(input.slot, input.generation)
+        );
+    };
+    let url = format!("http://{ip}:25566/activate");
+    let resp = http
+        .post(&url)
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if !resp.status().is_success() {
+        bail!("POST {url}: {}", resp.status());
+    }
+    Ok(())
+}
+
+/// Whether a warm instance still runs the image a fresh pod would pull (`Always` pull
+/// policy plus a moving tag does not roll a running pod). Missing pod or digest is
+/// "current": there is nothing to replace yet.
+pub async fn warm_is_current(
+    kube: &Kube,
+    http: &reqwest::Client,
+    input: &InstanceIn,
+) -> anyhow::Result<bool> {
+    let pod = format!("{}-0", instance_name(input.slot, input.generation));
+    let Some(pod) = kube.get_json("/api/v1", "pods", &pod).await? else {
+        return Ok(true);
+    };
+    let Some(running) = pod["status"]["containerStatuses"][0]["imageID"]
+        .as_str()
+        .and_then(|id| id.rsplit_once('@'))
+        .map(|(_, digest)| digest)
+    else {
+        return Ok(true);
+    };
+    let template = kube
+        .get_json("/api/v1", "podtemplates", POD_TEMPLATE)
+        .await?
+        .with_context(|| format!("PodTemplate {POD_TEMPLATE} not found"))?;
+    let image = template["template"]["spec"]["containers"]
+        .as_array()
+        .and_then(|cs| cs.iter().find(|c| c["name"] == CONTAINER))
+        .and_then(|c| c["image"].as_str())
+        .with_context(|| format!("PodTemplate {POD_TEMPLATE} has no {CONTAINER} image"))?;
+    let (host, repo, tag) = parse_image_ref(image)
+        .with_context(|| format!("cannot parse the image reference {image:?}"))?;
+    Ok(registry_digest(http, host, repo, tag).await? == running)
+}
+
+/// `(host, repo, tag)` of an image reference: the tag is after the last `:` that
+/// follows the last `/` (`latest` when absent), the host is the first path segment and
+/// must look like one (it names a registry). `None` for a reference this chart never
+/// produces, rather than guessing Docker Hub's implicit `library/`.
+fn parse_image_ref(image: &str) -> Option<(&str, &str, &str)> {
+    let last_slash = image.rfind('/')?;
+    let (named, tag) = match image.rfind(':') {
+        Some(colon) if colon > last_slash => (&image[..colon], &image[colon + 1..]),
+        _ => (image, "latest"),
+    };
+    let (host, repo) = named.split_once('/')?;
+    if repo.is_empty() || !(host.contains('.') || host.contains(':')) {
+        return None;
+    }
+    Some((host, repo, tag))
+}
+
+/// `(realm, service, scope)` of `Bearer realm="…",service="…",scope="…"`.
+fn parse_bearer_challenge(header: &str) -> Option<(String, String, String)> {
+    let rest = header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))?;
+    let mut realm = None;
+    let mut service = None;
+    let mut scope = None;
+    for part in rest.split(',') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').to_owned();
+        match key.trim() {
+            "realm" => realm = Some(value),
+            "service" => service = Some(value),
+            "scope" => scope = Some(value),
+            _ => {}
+        }
+    }
+    Some((realm?, service?, scope?))
+}
+
+/// The manifest media types a registry may answer `HEAD` with.
+const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
+    application/vnd.oci.image.manifest.v1+json, \
+    application/vnd.docker.distribution.manifest.v2+json, \
+    application/vnd.docker.distribution.manifest.list.v2+json";
+
+async fn registry_head(
+    http: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> anyhow::Result<reqwest::Response> {
+    let mut req = http
+        .head(url)
+        .header(reqwest::header::ACCEPT, MANIFEST_ACCEPT)
+        .timeout(Duration::from_secs(5));
+    if let Some(token) = token {
+        req = req.bearer_auth(token);
+    }
+    req.send().await.with_context(|| format!("HEAD {url}"))
+}
+
+/// The registry's digest of `{host}/{repo}:{tag}`, following a `Bearer` challenge.
+async fn registry_digest(
+    http: &reqwest::Client,
+    host: &str,
+    repo: &str,
+    tag: &str,
+) -> anyhow::Result<String> {
+    let url = format!("https://{host}/v2/{repo}/manifests/{tag}");
+    let mut resp = registry_head(http, &url, None).await?;
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        let challenge = resp
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let (realm, service, scope) = parse_bearer_challenge(&challenge)
+            .with_context(|| format!("unparsable www-authenticate {challenge:?}"))?;
+        // `reqwest` has no `query` feature here: build the token URL by hand.
+        let token_url = format!(
+            "{realm}{}service={}&scope={}",
+            if realm.contains('?') { '&' } else { '?' },
+            urlencoding::encode(&service),
+            urlencoding::encode(&scope)
+        );
+        let body: Value = http
+            .get(&token_url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .with_context(|| format!("GET {token_url}"))?
+            .json()
+            .await
+            .with_context(|| format!("GET {token_url}: body"))?;
+        let token = body["token"]
+            .as_str()
+            .with_context(|| format!("GET {token_url}: no token"))?
+            .to_owned();
+        resp = registry_head(http, &url, Some(&token)).await?;
+    }
+    if !resp.status().is_success() {
+        bail!("HEAD {url}: {}", resp.status());
+    }
+    resp.headers()
+        .get("docker-content-digest")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned)
+        .with_context(|| format!("HEAD {url}: no docker-content-digest"))
 }
 
 /// Deletes the instance's pod at once (`gracePeriodSeconds: 0`); the StatefulSet
@@ -411,6 +593,7 @@ mod tests {
             slot: 3,
             generation: 12,
             join_code: Some("ABCD".into()),
+            pre_game: false,
         };
         let sts = statefulset(&template, &input, 36003);
         assert_eq!(sts["metadata"]["name"], "rots-gs-3-g12");
@@ -450,5 +633,70 @@ mod tests {
         let claim = &sts["spec"]["volumeClaimTemplates"][0];
         assert_eq!(claim["metadata"]["name"], "data");
         assert_eq!(claim["spec"]["storageClassName"], STORAGE_CLASS);
+        // A pool instance boots in pre-game; a player's instance must not.
+        assert_eq!(get("ROTS_PRE_GAME"), vec![""]);
+        let pool = statefulset(
+            &template,
+            &InstanceIn {
+                pre_game: true,
+                ..input
+            },
+            36003,
+        );
+        let env: Vec<(String, String)> = pool["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                (
+                    v["name"].as_str().unwrap().into(),
+                    v["value"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env.iter()
+                .filter(|(n, _)| n == "ROTS_PRE_GAME")
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"]
+        );
+    }
+
+    #[test]
+    fn image_refs_split_into_host_repo_tag() {
+        assert_eq!(
+            parse_image_ref("ghcr.io/2143-labs/bevy2025:gameserver-latest"),
+            Some(("ghcr.io", "2143-labs/bevy2025", "gameserver-latest"))
+        );
+        assert_eq!(
+            parse_image_ref("localhost:5000/a/b"),
+            Some(("localhost:5000", "a/b", "latest"))
+        );
+        // A bare Docker Hub name says nothing about its registry here.
+        assert_eq!(parse_image_ref("bevy2025:x"), None);
+        assert_eq!(
+            parse_image_ref("ghcr.io/2143-labs/bevy2025"),
+            Some(("ghcr.io", "2143-labs/bevy2025", "latest"))
+        );
+    }
+
+    #[test]
+    fn bearer_challenges_parse() {
+        assert_eq!(
+            parse_bearer_challenge(
+                r#"Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:2143-labs/bevy2025:pull""#
+            ),
+            Some((
+                "https://ghcr.io/token".into(),
+                "ghcr.io".into(),
+                "repository:2143-labs/bevy2025:pull".into()
+            ))
+        );
+        assert_eq!(parse_bearer_challenge(r#"Basic realm="x""#), None);
+        assert_eq!(
+            parse_bearer_challenge("Bearer realm=\"https://x/token\""),
+            None
+        );
     }
 }
