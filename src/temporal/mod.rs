@@ -31,7 +31,7 @@ use tokio::sync::watch;
 use crate::api::{ApiError, AppState};
 use crate::sessions::SessionRow;
 use activities::{GameServerActivities, ProvisionerKind, SessionActivities};
-use coordinator::{CoordinatorArgs, CoordinatorWorkflow, PoolIn};
+use coordinator::{CodeIn, CodeOutcome, CoordinatorArgs, CoordinatorWorkflow, PoolIn};
 use server::{GameServerArgs, GameServerWorkflow};
 use session::{PlayIn, PlayOutcome, PlayerSessionWorkflow, SessionArgs};
 
@@ -348,6 +348,32 @@ pub async fn play(st: &AppState, s: &SessionRow) -> Result<PlayOutcome, ApiError
         }
         Err(_) => {
             tracing::error!("play: session update timed out after {PLAY_TIMEOUT:?}");
+            Err(unavailable())
+        }
+    }
+}
+
+/// Runs the coordinator's `resolve_code` update for the session's character.
+pub async fn join_code(
+    st: &AppState,
+    s: &SessionRow,
+    code: String,
+) -> Result<CodeOutcome, ApiError> {
+    let unavailable = || ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "temporal_unavailable");
+    let input = CodeIn {
+        code,
+        character_id: s.character_id,
+        sid: s.token_hash[..16].to_owned(),
+    };
+    let call = coordinator_update(st, CoordinatorWorkflow::resolve_code, input);
+    match tokio::time::timeout(PLAY_TIMEOUT, call).await {
+        Ok(Ok(outcome)) => Ok(outcome),
+        Ok(Err(e)) => {
+            tracing::error!("join-code: coordinator update failed: {e:#}");
+            Err(unavailable())
+        }
+        Err(_) => {
+            tracing::error!("join-code: timed out after {PLAY_TIMEOUT:?}");
             Err(unavailable())
         }
     }

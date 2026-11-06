@@ -201,6 +201,18 @@ async fn logout(st: &AppState, token: &str) {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+/// `POST /api/v1/join-code` for the session's character.
+async fn join_code(st: &AppState, token: &str, code: &str) -> (StatusCode, Value) {
+    call(
+        create_api(st.clone()),
+        Method::POST,
+        "/api/v1/join-code",
+        Some(token),
+        Some(json!({ "code": code })),
+    )
+    .await
+}
+
 /// The JSON payload of a ticket (no signature check; tickets.rs tests that).
 fn claims(ticket: &str) -> Value {
     let payload = ticket.split('.').nth(1).unwrap();
@@ -1025,6 +1037,152 @@ async fn new_player_gets_a_new_tutorial_instance(db: PgPool) {
     assert_eq!(s0.join(character, &sid).await.0, StatusCode::OK);
     status_becomes(&st, &sid, in_game(0)).await;
     assert_eq!(play_until_ready(&st, &b).await["server"]["slot"], 1);
+}
+
+/// A join code moves the character to the tutorial that has it: the old instance is told to
+/// evict it, `/play` answers with the new one, and the move replays cleanly.
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn join_code_moves_a_player_between_tutorials(db: PgPool) {
+    let (st, _worker) = connected_with(db, ProvisionerKind::Fake).await;
+    let (a, b) = (guest(&st).await, guest(&st).await);
+    assert_eq!(play(&st, &a).await, starting());
+    assert_eq!(play(&st, &b).await, starting());
+    let _calls = provisioned(&st, 2).await;
+
+    let s0 = FakeServer::start_instance(&st, 0, 1, "a", &[]);
+    let s1 = FakeServer::start_instance(&st, 1, 2, "b", &[]);
+    let body_a = play_until_ready(&st, &a).await;
+    let body_b = play_until_ready(&st, &b).await;
+    let (character_a, sid_a) = who(&body_a);
+    let (character_b, sid_b) = who(&body_b);
+    assert_eq!(s0.join(character_a, &sid_a).await.0, StatusCode::OK);
+    assert_eq!(s1.join(character_b, &sid_b).await.0, StatusCode::OK);
+    status_becomes(&st, &sid_a, in_game(0)).await;
+    status_becomes(&st, &sid_b, in_game(1)).await;
+    let code_b = body_b["server"]["join_code"].as_str().unwrap().to_owned();
+    assert_ne!(code_b, body_a["server"]["join_code"].as_str().unwrap());
+
+    // A joins B's tutorial: its character is rebound and instance 0 is told to evict it.
+    assert_eq!(
+        join_code(&st, &a, &code_b).await,
+        (StatusCode::OK, json!({"moved": true, "slot": 1}))
+    );
+    eventually(
+        "the old instance is told to evict",
+        Duration::from_secs(10),
+        || {
+            let st = st.clone();
+            async move {
+                fake_calls(&st).iter().any(|call| {
+                    matches!(
+                        call,
+                        FakeCall::Evict { instance, character_id }
+                            if instance.slot == 0 && instance.generation == 1
+                                && *character_id == character_a
+                    )
+                })
+            }
+        },
+    )
+    .await;
+
+    // `/play` answers with the new instance, and the join there is admitted.
+    let moved = play_until_ready(&st, &a).await;
+    assert_eq!(moved["server"]["slot"], 1, "{moved}");
+    assert_eq!(who(&moved).0, character_a);
+    assert_eq!(
+        s1.join(character_a, &sid_a).await,
+        (StatusCode::OK, json!({"result": "admitted"}))
+    );
+    // The old world lets go of the ghost: only then is the character's status the new slot.
+    s0.leave(character_a);
+    status_becomes(&st, &sid_a, in_game(1)).await;
+
+    // Already there, and a code no instance can have (the alphabet has no `I`).
+    assert_eq!(
+        join_code(&st, &a, &code_b).await,
+        (StatusCode::OK, json!({"moved": false}))
+    );
+    assert_eq!(
+        join_code(&st, &a, "IIII").await,
+        (StatusCode::NOT_FOUND, json!({"error": "unknown_join_code"}))
+    );
+
+    s1.leave(character_b);
+    replays_cleanly(&st, &[(0, 1), (1, 2)], &[&sid_a, &sid_b]).await;
+}
+
+/// A tutorial's flag saves every character in it, and only characters that exist.
+#[sqlx::test]
+#[ignore = "needs Postgres + Temporal"]
+async fn tutorial_done_saves_every_known_character(db: PgPool) {
+    let (st, _worker) = connected_with(db, ProvisionerKind::Fake).await;
+    let token = guest(&st).await;
+    let (status, me) = call(
+        create_api(st.clone()),
+        Method::GET,
+        "/api/v1/me",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let character = me["character_id"].as_i64().unwrap();
+
+    let (status, body) = call(
+        internal::router(st.clone()),
+        Method::POST,
+        "/internal/v1/servers/tutorial-done",
+        Some(TOKEN),
+        Some(json!({
+            "slot": 0,
+            "generation": 1,
+            "boot_id": "a",
+            "characters": [
+                { "character_id": character, "units": [{ "probe": 1 }] },
+                { "character_id": 999_999_999i64, "units": [] },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (units,): (Value,) =
+        sqlx::query_as("SELECT units FROM social.character_states WHERE character_id = $1")
+            .bind(character)
+            .fetch_one(&st.db)
+            .await
+            .unwrap();
+    assert_eq!(units, json!([{ "probe": 1 }]));
+    let (saved,): (i64,) = sqlx::query_as("SELECT count(*) FROM social.character_states")
+        .fetch_one(&st.db)
+        .await
+        .unwrap();
+    assert_eq!(saved, 1, "a character with no row is skipped");
+
+    // A second flag saves the same character again, overwriting its units.
+    let (status, _) = call(
+        internal::router(st.clone()),
+        Method::POST,
+        "/internal/v1/servers/tutorial-done",
+        Some(TOKEN),
+        Some(json!({
+            "slot": 1,
+            "generation": 2,
+            "boot_id": "b",
+            "characters": [{ "character_id": character, "units": [] }],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (units, slot): (Value, i32) =
+        sqlx::query_as("SELECT units, slot FROM social.character_states WHERE character_id = $1")
+            .bind(character)
+            .fetch_one(&st.db)
+            .await
+            .unwrap();
+    assert_eq!((units, slot), (json!([]), 1));
 }
 
 /// The pool is filled by the coordinator itself; the next player is placed on a warm

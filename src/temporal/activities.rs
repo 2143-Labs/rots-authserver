@@ -163,6 +163,17 @@ pub enum FakeCall {
     Delete(InstanceIn),
     Probe(InstanceIn),
     Kill(InstanceIn),
+    /// `/evict` on the instance at `slot`.
+    Evict {
+        instance: InstanceIn,
+        character_id: i64,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct EvictCharacterIn {
+    pub instance: InstanceIn,
+    pub character_id: i64,
 }
 
 pub struct GameServerActivities {
@@ -461,6 +472,41 @@ impl GameServerActivities {
                 Ok(())
             }
             ProvisionerKind::Static | ProvisionerKind::Fake => Ok(()),
+        }
+    }
+
+    /// Tells an instance to remove a character that moved to another tutorial.
+    #[activity]
+    pub async fn evict_character(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: EvictCharacterIn,
+    ) -> Result<(), ActivityError> {
+        match self.kind() {
+            ProvisionerKind::Kubernetes => {
+                k8s::evict(
+                    self.kube()?,
+                    &self.state.http,
+                    &self.state.config.coordinator_token,
+                    &input.instance,
+                    input.character_id,
+                )
+                .await?;
+                Ok(())
+            }
+            ProvisionerKind::Fake => {
+                self.state
+                    .fake_calls
+                    .lock()
+                    .expect("fake calls lock poisoned")
+                    .push(FakeCall::Evict {
+                        instance: input.instance,
+                        character_id: input.character_id,
+                    });
+                Ok(())
+            }
+            // Static servers have no join codes, so nothing is ever evicted from one.
+            ProvisionerKind::Static => Ok(()),
         }
     }
 

@@ -17,7 +17,7 @@ use axum::{
     routing::post,
 };
 use http::{StatusCode, header};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 
@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router {
             "/internal/v1/servers/shutdown-request",
             post(shutdown_request),
         )
+        .route("/internal/v1/servers/tutorial-done", post(tutorial_done))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -186,6 +187,53 @@ async fn shutdown_request(
     )
     .await?;
     Ok(Json(plan))
+}
+
+#[derive(Deserialize)]
+struct DumpIn {
+    character_id: i64,
+    units: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct TutorialDoneIn {
+    slot: u32,
+    generation: u64,
+    characters: Vec<DumpIn>,
+}
+
+/// A tutorial's flag was reached: save every character in it. Characters with no row
+/// (unverified connections) are skipped.
+async fn tutorial_done(State(st): State<AppState>, body: Bytes) -> Result<StatusCode, ApiError> {
+    let input: TutorialDoneIn = parse(&body)?;
+    check_slot(&st, input.slot)?;
+    for c in &input.characters {
+        sqlx::query!(
+            r#"INSERT INTO social.character_states (character_id, units, saved_from, slot, generation)
+               SELECT $1, $2, 'tutorial_complete', $3, $4
+               WHERE EXISTS (SELECT 1 FROM social.characters WHERE character_id = $1)
+               ON CONFLICT (character_id) DO UPDATE SET units = EXCLUDED.units,
+                 saved_from = EXCLUDED.saved_from, slot = EXCLUDED.slot,
+                 generation = EXCLUDED.generation, saved_at = now()"#,
+            c.character_id,
+            sqlx::types::Json(&c.units) as _,
+            input.slot as i32,
+            input.generation as i64,
+        )
+        .execute(&st.db)
+        .await
+        .map_err(|e| {
+            tracing::error!(path = "tutorial-done", "game-server report failed: {e:#}");
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "db_unavailable")
+        })?;
+    }
+    tracing::info!(
+        slot = input.slot,
+        generation = input.generation,
+        characters = input.characters.len(),
+        "tutorial complete: characters saved"
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
