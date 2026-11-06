@@ -31,8 +31,7 @@ use temporalio_sdk::{
 
 use super::activities::{GameServerActivities, ProvisionerKind, Rebuilt, StartServerIn};
 use super::now_secs;
-use super::server::GameServerWorkflow;
-use super::server::ServerInfo;
+use super::server::{EvictIn, GameServerWorkflow, ServerInfo};
 
 /// How long an assignment holds a slot for a player who has not joined yet: the
 /// ticket lifetime plus jsonwebtoken's default 60 s leeway.
@@ -129,6 +128,11 @@ pub enum Effect {
     Probe(InstanceRef),
     /// Tell the instance's workflow the coordinator is handing it to a player.
     Activate(InstanceRef),
+    /// Tell the instance's workflow to remove a character that moved elsewhere.
+    Evict {
+        instance: InstanceRef,
+        character_id: i64,
+    },
 }
 
 /// One instance: `(slot, generation)`.
@@ -245,6 +249,29 @@ pub enum JoinOutcome {
     },
 }
 
+/// A player asked to join the tutorial with this join code.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CodeIn {
+    pub code: String,
+    pub character_id: i64,
+    pub sid: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum CodeOutcome {
+    /// The character is now bound to this instance; its next `/play` is answered with it.
+    Moved {
+        slot: u32,
+        generation: u64,
+    },
+    /// The character is already on (or reserved on) that instance.
+    SameServer,
+    NotFound,
+    /// The instance exists but is not taking players (starting, recovering or draining).
+    Unavailable,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ReleaseIn {
     pub slot: u32,
@@ -286,6 +313,8 @@ pub struct ServerGoneIn {
 pub enum ShutdownReason {
     Idle,
     Sigterm,
+    /// A player reached the tutorial's flag: save everyone, then send them to the menu.
+    TutorialComplete,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -659,6 +688,51 @@ impl FleetState {
         JoinOutcome::Admitted
     }
 
+    /// Rebinds the character to the tutorial with `code` and has its old instance evict
+    /// it. Warm pool instances are never targets: nobody is there to join.
+    pub fn resolve_code(&mut self, input: &CodeIn) -> CodeOutcome {
+        let c = input.character_id;
+        let Some((slot, generation, phase)) = self
+            .servers
+            .iter()
+            .find(|(_, e)| !e.warm && e.join_code.as_deref() == Some(input.code.as_str()))
+            .map(|(s, e)| (*s, e.generation, e.phase))
+        else {
+            return CodeOutcome::NotFound;
+        };
+        if phase != Phase::Ready {
+            return CodeOutcome::Unavailable;
+        }
+        let bound = self.index.get(&c).map(|b| (b.slot, b.generation));
+        let reserved = self.reservations.get(&c).map(|r| (r.slot, r.generation));
+        if bound.or(reserved) == Some((slot, generation)) {
+            return CodeOutcome::SameServer;
+        }
+        self.reservations.remove(&c);
+        self.index.insert(
+            c,
+            Binding {
+                slot,
+                generation,
+                sid: input.sid.clone(),
+            },
+        );
+        // The old world keeps listing the character until it is evicted, so the binding
+        // alone is not enough: `adopt_players` would pull it back on the next report.
+        if let Some((from_slot, from_generation)) = bound
+            && self.entry(from_slot, from_generation).is_some()
+        {
+            self.outbox.push(Effect::Evict {
+                instance: InstanceRef {
+                    slot: from_slot,
+                    generation: from_generation,
+                },
+                character_id: c,
+            });
+        }
+        CodeOutcome::Moved { slot, generation }
+    }
+
     /// The character's units left the instance's world.
     pub fn release(&mut self, input: &ReleaseIn) {
         if self
@@ -729,7 +803,11 @@ impl FleetState {
             self.reservations.retain(|_, r| !on(r.slot, r.generation));
         }
         match input.reason {
-            ShutdownReason::Sigterm if !input.players.is_empty() => ShutdownPlan::ToMenu,
+            ShutdownReason::Sigterm | ShutdownReason::TutorialComplete
+                if !input.players.is_empty() =>
+            {
+                ShutdownPlan::ToMenu
+            }
             _ => ShutdownPlan::Destroy,
         }
     }
@@ -925,6 +1003,31 @@ impl CoordinatorWorkflow {
                         }
                         continue;
                     }
+                    Effect::Evict {
+                        instance,
+                        character_id,
+                    } => {
+                        let queue = ctx.state(|s| s.args.task_queue.clone());
+                        let sent = ctx
+                            .external_workflow(
+                                super::server_id(&queue, instance.slot, instance.generation),
+                                None,
+                            )
+                            .signal(
+                                GameServerWorkflow::evict,
+                                EvictIn { character_id },
+                                SignalWorkflowOptions::default(),
+                            )
+                            .await;
+                        if let Err(e) = sent {
+                            tracing::warn!(
+                                ?instance,
+                                character_id,
+                                "coordinator: evict not delivered: {e}"
+                            );
+                        }
+                        continue;
+                    }
                 };
                 if warm {
                     tracing::info!(slot, generation, "coordinator: warming the pool");
@@ -1005,6 +1108,12 @@ impl CoordinatorWorkflow {
             s.fleet.refill(&rules, now);
             outcome
         })
+    }
+
+    #[update]
+    pub async fn resolve_code(ctx: &mut WorkflowContext<Self>, input: CodeIn) -> CodeOutcome {
+        let _ = ctx.wait_condition(|s: &Self| s.fleet.rebuilt).await;
+        ctx.state_mut(|s| s.fleet.resolve_code(&input))
     }
 
     #[signal]
@@ -1122,6 +1231,14 @@ mod tests {
         ClaimIn {
             slot,
             generation,
+            character_id: c,
+            sid: sid.into(),
+        }
+    }
+
+    fn code_in(code: &str, c: i64, sid: &str) -> CodeIn {
+        CodeIn {
+            code: code.into(),
             character_id: c,
             sid: sid.into(),
         }
@@ -1302,6 +1419,124 @@ mod tests {
                 players: vec![1],
             }),
             ShutdownPlan::ToMenu
+        );
+    }
+
+    #[test]
+    fn resolve_code_moves_the_binding_and_evicts() {
+        let mut f = rebuilt();
+        // Two tutorials, one character each, both Ready with their own join code.
+        f.place(&place(1, "s1"), &MANAGED, 100);
+        f.place(&place(2, "s2"), &MANAGED, 100);
+        f.server_ready(&hb(0, 1, &[(1, "s1")]));
+        f.server_ready(&hb(1, 2, &[(2, "s2")]));
+        let code_b = f.servers[&1].join_code.clone().unwrap();
+        f.outbox.clear();
+
+        assert_eq!(
+            f.resolve_code(&code_in(&code_b, 1, "s1")),
+            CodeOutcome::Moved {
+                slot: 1,
+                generation: 2
+            }
+        );
+        assert_eq!((f.index[&1].slot, f.index[&1].generation), (1, 2));
+        assert_eq!(f.index[&1].sid, "s1");
+        assert_eq!(
+            f.outbox,
+            vec![Effect::Evict {
+                instance: InstanceRef {
+                    slot: 0,
+                    generation: 1
+                },
+                character_id: 1,
+            }],
+            "the old world is told to let the character go"
+        );
+    }
+
+    #[test]
+    fn resolve_code_to_the_current_instance_is_same_server() {
+        let mut f = rebuilt();
+        f.place(&place(1, "s1"), &MANAGED, 100);
+        f.server_ready(&hb(0, 1, &[(1, "s1")]));
+        let code = f.servers[&0].join_code.clone().unwrap();
+        f.outbox.clear();
+        assert_eq!(
+            f.resolve_code(&code_in(&code, 1, "s1")),
+            CodeOutcome::SameServer
+        );
+        assert!(f.outbox.is_empty());
+    }
+
+    #[test]
+    fn resolve_code_ignores_unknown_and_warm_codes() {
+        let mut f = rebuilt();
+        f.place(&place(1, "s1"), &POOLED, 100);
+        // The pool instance is booted but nobody is on it to join.
+        let warm_slot = f
+            .servers
+            .iter()
+            .find(|(_, e)| e.warm)
+            .map(|(s, _)| *s)
+            .unwrap();
+        let warm_generation = f.servers[&warm_slot].generation;
+        f.server_ready(&hb(warm_slot, warm_generation, &[]));
+        let warm_code = f.servers[&warm_slot].join_code.clone().unwrap();
+        assert_eq!(
+            f.resolve_code(&code_in(&warm_code, 1, "s1")),
+            CodeOutcome::NotFound
+        );
+        // The alphabet has no `I`, so this code is never generated.
+        assert_eq!(
+            f.resolve_code(&code_in("IIII", 1, "s1")),
+            CodeOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn resolve_code_to_a_provisioning_instance_is_unavailable() {
+        let mut f = rebuilt();
+        f.place(&place(1, "s1"), &MANAGED, 100);
+        let code = f.servers[&0].join_code.clone().unwrap();
+        assert_eq!(
+            f.resolve_code(&code_in(&code, 1, "s1")),
+            CodeOutcome::Unavailable,
+            "a starting instance cannot be joined yet"
+        );
+        // Ready now, and the same character is on it: nobody to move.
+        f.server_ready(&hb(0, 1, &[(1, "s1")]));
+        assert_eq!(
+            f.resolve_code(&code_in(&code, 1, "s1")),
+            CodeOutcome::SameServer
+        );
+    }
+
+    #[test]
+    fn a_completed_tutorial_sends_its_players_to_the_menu() {
+        let mut f = rebuilt();
+        f.place(&place(1, "s1"), &MANAGED, 100);
+        f.server_ready(&hb(0, 1, &[(1, "s1")]));
+        assert_eq!(
+            f.request_shutdown(&ShutdownIn {
+                slot: 0,
+                generation: 1,
+                reason: ShutdownReason::TutorialComplete,
+                players: vec![1],
+            }),
+            ShutdownPlan::ToMenu
+        );
+        // With nobody on board there is nothing to send back: the world is just destroyed.
+        f.place(&place(2, "s2"), &MANAGED, 200);
+        f.server_ready(&hb(1, 2, &[]));
+        assert_eq!(
+            f.request_shutdown(&ShutdownIn {
+                slot: 1,
+                generation: 2,
+                reason: ShutdownReason::TutorialComplete,
+                players: vec![],
+            }),
+            ShutdownPlan::Destroy
         );
     }
 

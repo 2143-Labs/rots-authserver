@@ -30,8 +30,8 @@ use temporalio_sdk::{
 };
 
 use super::activities::{
-    CoordinatorReport, GameServerActivities, InstanceHealth, InstanceIn, ProbeResult,
-    ProvisionOutcome, ProvisionerKind,
+    CoordinatorReport, EvictCharacterIn, GameServerActivities, InstanceHealth, InstanceIn,
+    ProbeResult, ProvisionOutcome, ProvisionerKind,
 };
 use super::coordinator::{
     ClaimIn, GoneReason, InstanceRef, JoinOutcome, MAX_HISTORY, Phase, PlayerRef, RUN_SECS,
@@ -128,6 +128,11 @@ pub struct ShutdownRequestIn {
     pub players: Vec<i64>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct EvictIn {
+    pub character_id: i64,
+}
+
 /// What the instance's workflow knows, as answered by the `server` query.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ServerInfo {
@@ -150,6 +155,8 @@ pub enum ServerEffect {
     Report(CoordinatorReport),
     /// POST `/activate` on the instance, so its world leaves pre-game.
     Activate,
+    /// POST `/evict` on the instance: the character moved to another tutorial.
+    Evict(i64),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -379,6 +386,14 @@ impl ServerState {
             self.warm = false;
             self.next_warm_check = 0;
             self.outbox.push(ServerEffect::Activate);
+        }
+    }
+
+    /// The character moved to another tutorial: the coordinator's `evict` signal.
+    pub fn evict(&mut self, character_id: i64) {
+        // A draining world is going away anyway.
+        if self.phase != Phase::Draining {
+            self.outbox.push(ServerEffect::Evict(character_id));
         }
     }
 
@@ -635,6 +650,26 @@ async fn drain(ctx: &mut WorkflowContext<GameServerWorkflow>) {
                     );
                 }
             }
+            ServerEffect::Evict(character_id) => {
+                let instance = ctx.state(|s| s.instance());
+                if let Err(e) = ctx
+                    .execute_local_activity(
+                        GameServerActivities::evict_character,
+                        EvictCharacterIn {
+                            instance: instance.clone(),
+                            character_id,
+                        },
+                        la(10, 3),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        ?instance,
+                        character_id,
+                        "game-server workflow: evict not delivered: {e}"
+                    );
+                }
+            }
             ServerEffect::Report(report) => {
                 // Signal-with-start: a terminated coordinator is recreated, not lost.
                 if let Err(e) = ctx
@@ -886,6 +921,12 @@ impl GameServerWorkflow {
         self.state.activated();
     }
 
+    /// The character moved to another tutorial: remove it from this world.
+    #[signal]
+    pub fn evict(&mut self, _ctx: &mut SyncWorkflowContext<Self>, input: EvictIn) {
+        self.state.evict(input.character_id);
+    }
+
     /// Claims the character at the coordinator, then records it here.
     #[update]
     pub async fn join(ctx: &mut WorkflowContext<Self>, input: JoinIn) -> JoinOutcome {
@@ -1014,7 +1055,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 ServerEffect::Report(r) => Some(r),
-                ServerEffect::Presence(_) | ServerEffect::Activate => None,
+                ServerEffect::Presence(_) | ServerEffect::Activate | ServerEffect::Evict(_) => None,
             })
             .collect()
     }
@@ -1289,6 +1330,21 @@ mod tests {
         d.outbox.clear();
         d.activated();
         assert!(d.warm && d.outbox.is_empty());
+    }
+
+    #[test]
+    fn evict_pushes_an_evict_effect() {
+        let a = args(ProvisionerKind::Kubernetes);
+        let mut s = ServerState::new(&a, 0);
+        s.heartbeat(&a, &hb("b", &[], 0), 10);
+        s.outbox.clear();
+        s.evict(5);
+        assert_eq!(s.outbox, vec![ServerEffect::Evict(5)]);
+        // A draining world is going away anyway.
+        s.outbox.clear();
+        s.draining(&ShutdownPlan::Destroy, 20);
+        s.evict(6);
+        assert!(s.outbox.is_empty());
     }
 
     #[test]

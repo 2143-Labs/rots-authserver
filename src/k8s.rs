@@ -380,6 +380,35 @@ pub async fn activate(
     Ok(())
 }
 
+/// POSTs `/evict` on the instance's health port: the character moved to another tutorial.
+pub async fn evict(
+    kube: &Kube,
+    http: &reqwest::Client,
+    token: &str,
+    input: &InstanceIn,
+    character_id: i64,
+) -> anyhow::Result<()> {
+    let Some(ip) = pod_ip(kube, input).await? else {
+        bail!(
+            "{}: no pod IP to evict",
+            instance_name(input.slot, input.generation)
+        );
+    };
+    let url = format!("http://{ip}:25566/evict");
+    let resp = http
+        .post(&url)
+        .bearer_auth(token)
+        .json(&json!({ "character_id": character_id }))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    if !resp.status().is_success() {
+        bail!("POST {url}: {}", resp.status());
+    }
+    Ok(())
+}
+
 /// Whether a warm instance still runs the image a fresh pod would pull (`Always` pull
 /// policy plus a moving tag does not roll a running pod). Missing pod or digest is
 /// "current": there is nothing to replace yet.

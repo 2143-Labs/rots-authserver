@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO social.character_states (character_id, units, saved_from, slot, generation)\n               SELECT $1, $2, 'tutorial_complete', $3, $4\n               WHERE EXISTS (SELECT 1 FROM social.characters WHERE character_id = $1)\n               ON CONFLICT (character_id) DO UPDATE SET units = EXCLUDED.units,\n                 saved_from = EXCLUDED.saved_from, slot = EXCLUDED.slot,\n                 generation = EXCLUDED.generation, saved_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Jsonb",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "123f04b6d06984845123829836e34495bcad6fb0656e9bbbc398bae66e0f6116"
+}

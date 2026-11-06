@@ -18,7 +18,7 @@ use crate::{
     Config,
     providers::{self, ProviderConfig, Providers},
     sessions::{self, SESSION_COOKIE, SESSION_TTL_DAYS, Session},
-    temporal::{self, TemporalSlot, session::PlayOutcome},
+    temporal::{self, TemporalSlot, coordinator::CodeOutcome, session::PlayOutcome},
     tickets::{self, TicketKeys},
 };
 
@@ -45,6 +45,7 @@ pub fn create_api(state: AppState) -> Router {
         .route("/guest", post(create_guest))
         .route("/me", get(me))
         .route("/play", post(play))
+        .route("/join-code", post(join_code))
         .route("/my-server-crashed", post(my_server_crashed))
         .route("/steam/ticket", post(steam_ticket_login))
         .route("/steam/callback", get(steam_callback))
@@ -320,6 +321,33 @@ async fn play(
             tracing::warn!(sid = &s.token_hash[..16], reason, "play failed");
             Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct JoinCodeBody {
+    code: String,
+}
+
+/// Moves the session's character into the tutorial with that join code. The client then
+/// reconnects: `/play` answers with the new instance.
+async fn join_code(
+    State(st): State<AppState>,
+    Session(session): Session,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let s = session.ok_or_else(ApiError::no_session)?;
+    let JoinCodeBody { code } = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad_request"))?;
+    let code = code.trim().to_ascii_uppercase();
+    if code.chars().count() != 4 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown_join_code"));
+    }
+    match temporal::join_code(&st, &s, code).await? {
+        CodeOutcome::Moved { slot, .. } => Ok(Json(json!({ "moved": true, "slot": slot }))),
+        CodeOutcome::SameServer => Ok(Json(json!({ "moved": false }))),
+        CodeOutcome::NotFound => Err(ApiError::new(StatusCode::NOT_FOUND, "unknown_join_code")),
+        CodeOutcome::Unavailable => Err(ApiError::new(StatusCode::CONFLICT, "target_unavailable")),
     }
 }
 

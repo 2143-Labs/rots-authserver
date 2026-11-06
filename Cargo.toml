@@ -30,7 +30,7 @@ serde_json = { version = "1.0.149" }
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10"
 sqlx-core = { version = "0.8.6" }
-sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "uuid", "migrate", "macros"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "uuid", "migrate", "macros", "json"] }
 struct-patch = { version = "0.10.4" }
 subtle = "2"
 temporalio-client = "1.1.1"
